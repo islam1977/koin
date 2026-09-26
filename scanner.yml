@@ -1,0 +1,48 @@
+name: Binance Early-Pump Scanner
+
+on:
+  schedule:
+    # GitHub's minimum interval is every 5 minutes. Actual start time can
+    # slip by a few minutes during high load on GitHub's side — this is
+    # documented/expected behavior, not a bug in the workflow.
+    - cron: '*/5 * * * *'
+  workflow_dispatch: {}   # lets you trigger a manual run from the Actions tab
+
+permissions:
+  contents: write   # needed so the job can commit the updated state files back
+
+concurrency:
+  group: binance-scanner
+  cancel-in-progress: false   # never kill a run that's mid-scan; just queue the next one
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4   # keep well under the 5-minute schedule interval
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run one scan cycle
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python binance_early_pump.py --once
+
+      - name: Save updated state back to the repo
+        run: |
+          git config user.name "scanner-bot"
+          git config user.email "scanner-bot@users.noreply.github.com"
+          git add scanner_alerts.csv signal_outcomes.csv trailing_stop_sim.csv \
+                   pending_outcomes.json last_alert.json scan_count.json 2>/dev/null || true
+          git diff --cached --quiet || git commit -m "Update scanner state [skip ci]"
+          git push
