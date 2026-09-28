@@ -1,0 +1,30 @@
+name: Telegram Test
+
+# workflow يدوي بس: بيبعت رسالة تجربة واحدة للتليجرام عشان تتأكد إن الربط شغال.
+on:
+  workflow_dispatch: {}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Send test message
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "ERROR: TELEGRAM_BOT_TOKEN او TELEGRAM_CHAT_ID مش مضافين في Secrets."
+            exit 1
+          fi
+
+          code=$(curl -s -o resp.json -w "%{http_code}" \
+            -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=✅ اختبار ناجح: الربط بين GitHub والتليجرام شغال. هتوصلك هنا إشارات السكانر لما تظهر.")
+
+          echo "HTTP status: $code"
+          python3 -c "import json; d=json.load(open('resp.json')); print('ok:', d.get('ok'), '|', d.get('description', ''))"
+
+          [ "$code" = "200" ]
