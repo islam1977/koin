@@ -9,9 +9,6 @@ on:
 permissions:
   contents: write   # عشان الـ job يحفظ ملفات الحالة والنتائج في الريبو
 
-concurrency:
-  group: binance-scanner
-  cancel-in-progress: false
 
 jobs:
   scan:
