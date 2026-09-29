@@ -64,6 +64,25 @@ CANDIDATE_EXPIRY_MINUTES = 20
 # بعد إرسال FINAL لا نرسل نفس العملة مرة أخرى خلال هذه المدة.
 FINAL_COOLDOWN_HOURS = 12
 
+# ---------- تأكيد عبر بورصات تانية (Cross-Exchange Confirmation) ----------
+# بنتأكد من نفس العملة على Bybit و OKX قبل إرسال FINAL بس (مش كل دورة فحص)،
+# عشان نقلل الإشارات الكاذبة اللي سببها نشاط محصور على Binance بس
+# (زي wash trading)، ونديك صورة أوضح هل الحركة حقيقية في السوق كله.
+BYBIT_BASE = "https://api.bybit.com"
+OKX_BASE = "https://www.okx.com"
+
+# لو التغير في الساعة الأخيرة على بورصة تانية >= الرقم ده، نعتبرها موافقة.
+CROSS_CONFIRM_AGREE_PCT = 1.0
+# لو التغير <= الرقم ده (سالب)، نعتبرها تعارض واضح مع حركة Binance.
+CROSS_CONFIRM_DISAGREE_PCT = -1.0
+
+# لو True: أي عملة عليها "تعارض واضح" من البورصتين مع مفيش أي موافقة،
+# ميتبعتش لها FINAL خالص (بيتسجل في الـ log بس). لو False: بتتبعت
+# برضه لكن الرسالة بتوضح التعارض عشان تاخد قرارك بنفسك.
+# الافتراضي False لأن فشل مؤقت في API بورصة تانية (مش نادر) مش المفروض
+# يمنع إشارة حقيقية على Binance؛ التوضيح في الرسالة كافي غالبًا.
+SUPPRESS_ON_DIVERGENCE = False
+
 # ---------- تتبع النتيجة ----------
 
 TRACK_MINUTES = [5, 15, 30, 60, 240, 1440]
@@ -448,7 +467,134 @@ def update_tracking(tickers):
         del active_tracks[symbol]
 
 
-def format_final(x, confirmations):
+# ============================================================
+# CROSS-EXCHANGE CONFIRMATION (Bybit + OKX)
+# ============================================================
+
+def okx_inst_id(binance_symbol):
+    """RADUSDT -> RAD-USDT (كل أزواجنا مقابل USDT أصلاً)."""
+    base = binance_symbol[:-4] if binance_symbol.endswith("USDT") else binance_symbol
+    return f"{base}-USDT"
+
+
+def get_bybit_klines_15m(symbol, limit=6):
+    """آخر limit شمعة 15 دقيقة من Bybit، الأحدث أولًا. None لو مش موجودة/فشل الطلب."""
+    try:
+        r = session.get(
+            f"{BYBIT_BASE}/v5/market/kline",
+            params={"category": "spot", "symbol": symbol, "interval": "15", "limit": limit},
+            timeout=8,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if data.get("retCode") != 0:
+            return None
+        rows = data.get("result", {}).get("list", [])
+        return rows or None
+    except Exception:
+        return None
+
+
+def get_okx_klines_15m(inst_id, limit=6):
+    """آخر limit شمعة 15 دقيقة من OKX، الأحدث أولًا. None لو مش موجودة/فشل الطلب."""
+    try:
+        r = session.get(
+            f"{OKX_BASE}/api/v5/market/candles",
+            params={"instId": inst_id, "bar": "15m", "limit": limit},
+            timeout=8,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if data.get("code") != "0":
+            return None
+        rows = data.get("data", [])
+        return rows or None
+    except Exception:
+        return None
+
+
+def klines_1h_change_pct(rows, close_index):
+    """رجّع نسبة التغير خلال آخر ساعة تقريبًا (4 شمعات * 15 دقيقة)
+    من قائمة شموع مرتبة الأحدث أولًا، أو None لو البيانات مش كفاية."""
+    if not rows:
+        return None
+    back = min(4, len(rows) - 1)
+    if back <= 0:
+        return None
+    try:
+        latest = float(rows[0][close_index])
+        older = float(rows[back][close_index])
+        if older == 0:
+            return None
+        return (latest / older - 1.0) * 100.0
+    except (ValueError, IndexError):
+        return None
+
+
+def cross_exchange_confirmation(binance_symbol):
+    """
+    بيشوف نفس العملة على Bybit وOKX ويرجّع (label, detail):
+    - "CONFIRMED"        : بورصة تانية على الأقل بتأكد نفس الحركة صاعدة
+    - "DIVERGENCE"       : مفيش موافقة، وفي بورصة بتاعد عكس الحركة تمامًا
+    - "NEUTRAL"          : موجودة في بورصة تانية بس التغير مش واضح كفاية
+    - "BINANCE-EXCLUSIVE": مش لاقيينها على Bybit ولا OKX (عادي لعملات حديثة الإدراج)
+    بيتنادى بس على المرشحين اللي وصلوا لعتبة FINAL، مش كل دورة فحص،
+    فمكلفش أداء السكانر ككل.
+    """
+    notes = []
+    agree = 0
+    disagree = 0
+    listed_anywhere = False
+
+    bybit_rows = get_bybit_klines_15m(binance_symbol)
+    if bybit_rows:
+        listed_anywhere = True
+        chg = klines_1h_change_pct(bybit_rows, close_index=4)
+        if chg is not None:
+            notes.append(f"Bybit 1h: {chg:+.2f}%")
+            if chg >= CROSS_CONFIRM_AGREE_PCT:
+                agree += 1
+            elif chg <= CROSS_CONFIRM_DISAGREE_PCT:
+                disagree += 1
+
+    okx_rows = get_okx_klines_15m(okx_inst_id(binance_symbol))
+    if okx_rows:
+        listed_anywhere = True
+        chg = klines_1h_change_pct(okx_rows, close_index=4)
+        if chg is not None:
+            notes.append(f"OKX 1h: {chg:+.2f}%")
+            if chg >= CROSS_CONFIRM_AGREE_PCT:
+                agree += 1
+            elif chg <= CROSS_CONFIRM_DISAGREE_PCT:
+                disagree += 1
+
+    if not listed_anywhere:
+        label = "BINANCE-EXCLUSIVE"
+    elif agree > 0:
+        label = "CONFIRMED"
+    elif disagree > 0:
+        label = "DIVERGENCE"
+    else:
+        label = "NEUTRAL"
+
+    detail = " | ".join(notes) if notes else "لا توجد بيانات من بورصات تانية"
+    return label, detail
+
+
+CROSS_LABEL_EMOJI = {
+    "CONFIRMED": "✅",
+    "DIVERGENCE": "⚠️",
+    "NEUTRAL": "➖",
+    "BINANCE-EXCLUSIVE": "🔒",
+}
+
+
+def format_final(x, confirmations, cross_label=None, cross_detail=None):
+    cross_section = ""
+    if cross_label:
+        emoji = CROSS_LABEL_EMOJI.get(cross_label, "")
+        cross_section = f"\nCross-exchange check: {emoji} {cross_label}\n{cross_detail}\n"
+
     return f"""🔥 FINAL EARLY-PUMP CANDIDATE
 
 ⚠️ هذه إشارة تحليلية وليست ضمانًا أو أمر شراء.
@@ -474,7 +620,7 @@ Liquidity: {x['liquidity']}
 24h Volume: ${x['quote_volume']:,.0f}
 
 Confirmation scans: {confirmations}
-
+{cross_section}
 📌 لماذا ظهرت؟
 السعر + الحجم + تسارع الحجم + الاختراق
 اجتمعت في نفس الوقت.
@@ -559,12 +705,24 @@ def maybe_final_signal(x, now):
     if confirmed or exceptional:
         final_x = x if x["score"] >= c["best"]["score"] else c["best"]
 
+        # تأكيد عبر Bybit وOKX — بس للمرشحين اللي وصلوا هنا فعلاً،
+        # مش لكل عملة بتتفحص، عشان ما يبطأش السكانر.
+        cross_label, cross_detail = cross_exchange_confirmation(symbol)
+
+        if SUPPRESS_ON_DIVERGENCE and cross_label == "DIVERGENCE":
+            print(f"\n[Cross-exchange] {symbol}: DIVERGENCE — FINAL اتمنع. {cross_detail}")
+            final_cooldown[symbol] = now
+            candidates.pop(symbol, None)
+            return False
+
         final_cooldown[symbol] = now
         candidates.pop(symbol, None)
 
         message = format_final(
             final_x,
-            c["count"]
+            c["count"],
+            cross_label=cross_label,
+            cross_detail=cross_detail,
         )
 
         telegram_send(message)
