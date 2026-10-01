@@ -17,7 +17,6 @@
 # الإشارة هي نظام قياس واحتمال، وليست توصية استثمارية مؤكدة.
 # ============================================================
 
-!pip -q install requests pandas
 
 import requests, time, math, csv, os
 import pandas as pd
