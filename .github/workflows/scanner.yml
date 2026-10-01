@@ -1,4 +1,4 @@
-name: Binance Early-Pump Scanner V2
+name: Binance Early-Pump Scanner V3
 
 on:
   schedule:
@@ -32,7 +32,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python binance_early_pump_v2.py --once
+        run: python binance_early_pump_v3.py --once
 
       - name: Save state and results back to the repo
         if: always()
