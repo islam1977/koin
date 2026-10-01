@@ -17,7 +17,7 @@
 # الإشارة هي نظام قياس واحتمال، وليست توصية استثمارية مؤكدة.
 # ============================================================
 
-
+import os
 import requests, time, math, csv, os
 import pandas as pd
 from datetime import datetime, timezone
@@ -70,8 +70,8 @@ TRACK_FILE = "/content/early_pump_signal_results.csv"
 print("أدخل بيانات Telegram.")
 print("يمكنك تركها فارغة إذا أردت الاختبار داخل Colab فقط.")
 
-TELEGRAM_BOT_TOKEN = input("TELEGRAM_BOT_TOKEN: ").strip()
-TELEGRAM_CHAT_ID = input("TELEGRAM_CHAT_ID: ").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 session = requests.Session()
 session.headers.update({"User-Agent": "Binance-Early-Pump-Scanner-V2/1.0"})
