@@ -17,7 +17,7 @@
 # الإشارة هي نظام قياس واحتمال، وليست توصية استثمارية مؤكدة.
 # ============================================================
 
-import os
+
 import requests, time, math, csv, os
 import pandas as pd
 from datetime import datetime, timezone
@@ -63,12 +63,11 @@ FINAL_COOLDOWN_HOURS = 12
 TRACK_MINUTES = [5, 15, 30, 60, 240, 1440]
 
 # ملف النتائج
-TRACK_FILE = "/content/early_pump_signal_results.csv"
+TRACK_FILE = "early_pump_signal_results.csv"
 
 # ---------- Telegram ----------
 
-print("أدخل بيانات Telegram.")
-print("يمكنك تركها فارغة إذا أردت الاختبار داخل Colab فقط.")
+import os
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
