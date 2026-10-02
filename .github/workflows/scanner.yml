@@ -1,10 +1,13 @@
 name: Binance Early-Pump Scanner V2
 
 on:
-  schedule:
-    # أقل فاصل تسمح به GitHub هو 5 دقائق، وممكن يتأخر شوية وقت الزحام.
-    - cron: '*/5 * * * *'
-  workflow_dispatch: {}   # للتشغيل اليدوي من تبويب Actions
+  # الجدولة الداخلية بتاعة GitHub (schedule/cron) اتشالت من هنا عمدًا:
+  # كانت بتتأخر 15-60+ دقيقة وقت الزحام، وده كان بيخلي السكانر يفوّت
+  # قفزات سريعة. دلوقتي خدمة خارجية (cron-job.org) هي اللي بتستدعي
+  # الـ workflow كل دقيقتين بدقة عن طريق GitHub API، فمحتاجين بس
+  # workflow_dispatch يفضل مفعّل عشان يستقبل الاستدعاء ده (وكمان
+  # يسمح بالتشغيل اليدوي من تبويب Actions لو احتجته).
+  workflow_dispatch: {}
 
 permissions:
   contents: write   # عشان الـ job يحفظ ملفات الحالة والنتائج في الريبو
