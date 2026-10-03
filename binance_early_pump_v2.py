@@ -54,6 +54,25 @@ MAX_15M_GAIN = 10.0
 MIN_1H_GAIN = -5.0
 MAX_1H_GAIN = 18.0
 
+# ---------- مستويات دخول/خروج مقترحة (Risk Management) ----------
+# دي نسب مئوية ثابتة وبسيطة من سعر الإشارة، مش تحليل عميق لتذبذب
+# العملة (زي ATR). الهدف إنها تدّيك نقطة مرجعية سريعة تحسب عليها
+# حجم صفقتك ومخاطرتك بنفسك، مش توصية بشراء أو ضمان لأي ربح.
+STOP_LOSS_PCT = 8.0        # وقف خسارة تحت سعر الدخول
+TAKE_PROFIT_1_PCT = 25.0   # هدف أول: مكسب جيد وواقعي
+TAKE_PROFIT_2_PCT = 30.0   # هدف ثاني: لو الزخم استمر
+
+# تأكيد حركة سعر حقيقية قبل أي FINAL (بغض النظر عن الـ Score):
+# لازم واحد من الاتنين يتحقق على الأقل. ده بيمنع إن حجم تداول ضخم
+# لوحده (من غير حركة سعر فعلية) يوصل لـFINAL، زي ما حصل مع
+# DODOUSDT (حجم 61x لكن 24h=-0.97%) وMEMEUSDT (حجم 14x لكن 1h=0.69%).
+MIN_PRICE_CONFIRM_15M = 1.5
+MIN_PRICE_CONFIRM_1H = 3.0
+
+
+def has_price_confirmation(x):
+    return x["15m"] >= MIN_PRICE_CONFIRM_15M or x["1h"] >= MIN_PRICE_CONFIRM_1H
+
 # الدرجات
 WATCH_SCORE = 65
 FINAL_SCORE = 80
@@ -158,6 +177,16 @@ def telegram_send(message):
         return False
 
 
+# عملات مستقرة (Stablecoins) مربوطة بسعر تقريبًا ثابت (غالبًا $1).
+# مينفعش "تنفجر" أصلًا، لكن نسب الحجم عندها ممكن تطلع أرقام جنونية
+# (زي BFUSDUSDT اللي طلعت acceleration=173x من غير أي حركة سعر
+# حقيقية) لمجرد إن حجمها الأساسي صغير. بنستبعدها من الأساس.
+STABLECOIN_BASES = {
+    "USDC", "FDUSD", "TUSD", "USDP", "DAI", "BUSD", "BFUSD",
+    "USDE", "PYUSD", "EUR", "GBP", "AEUR", "USD1", "WBETH",
+}
+
+
 def get_symbols():
     data = get_json("/api/v3/exchangeInfo")
     symbols = []
@@ -174,6 +203,10 @@ def get_symbols():
 
         if any(x in symbol for x in
                ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")):
+            continue
+
+        base = symbol[:-4]  # إزالة "USDT" من آخر الاسم
+        if base in STABLECOIN_BASES:
             continue
 
         symbols.append(symbol)
@@ -667,6 +700,11 @@ def format_final(x, confirmations, cross_label=None, cross_detail=None):
         emoji = CROSS_LABEL_EMOJI.get(cross_label, "")
         cross_section = f"\nCross-exchange check: {emoji} {cross_label}\n{cross_detail}\n"
 
+    entry = x["price"]
+    stop_loss = entry * (1 - STOP_LOSS_PCT / 100)
+    take_profit_1 = entry * (1 + TAKE_PROFIT_1_PCT / 100)
+    take_profit_2 = entry * (1 + TAKE_PROFIT_2_PCT / 100)
+
     return f"""🔥 FINAL EARLY-PUMP CANDIDATE
 
 ⚠️ هذه إشارة تحليلية وليست ضمانًا أو أمر شراء.
@@ -693,6 +731,12 @@ Liquidity: {x['liquidity']}
 
 Confirmation scans: {confirmations}
 {cross_section}
+💰 مستويات مقترحة (نسب ثابتة، مش تحليل تذبذب دقيق):
+Entry: {entry:.12g}
+🎯 Target 1 (+{TAKE_PROFIT_1_PCT:.0f}%): {take_profit_1:.12g}
+🎯 Target 2 (+{TAKE_PROFIT_2_PCT:.0f}%): {take_profit_2:.12g}
+🛑 Stop-loss (-{STOP_LOSS_PCT:.0f}%): {stop_loss:.12g}
+
 📌 لماذا ظهرت؟
 السعر + الحجم + تسارع الحجم + الاختراق
 اجتمعت في نفس الوقت.
@@ -700,7 +744,9 @@ Confirmation scans: {confirmations}
 📊 سيتم الآن تتبع النتيجة تلقائيًا:
 5m / 15m / 30m / 1h / 4h / 24h
 
-⚠️ لا يوجد تداول آلي في هذه النسخة.
+⚠️ المستويات دي مبنية على نسبة ثابتة بسيطة، مش توصية مالية ولا
+ضمان ربح. قرار الدخول والخروج ومقدار المخاطرة بتاعك إنت.
+لا يوجد تداول آلي في هذه النسخة.
 """
 
 
@@ -921,8 +967,11 @@ def run_cycle(symbols):
             log_early_watch(x, now)
 
             # لا نرسل أي شيء عند 65.
-            # فقط نبدأ confirmation داخلي عند 80+.
-            if x["score"] >= FINAL_SCORE:
+            # فقط نبدأ confirmation داخلي عند 80+، وبشرط إن السعر
+            # نفسه بيتحرك فعلاً (مش بس الحجم)، عشان نتجنب حالات زي
+            # DODOUSDT/MEMEUSDT اللي وصلت Score 80+ بسبب حجم ضخم
+            # بينما السعر كان شبه ثابت أو نازل.
+            if x["score"] >= FINAL_SCORE and has_price_confirmation(x):
                 maybe_final_signal(x, now)
 
     print(f"\nActive final tracks: {len(active_tracks)}")
