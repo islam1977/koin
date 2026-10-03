@@ -186,6 +186,26 @@ STABLECOIN_BASES = {
     "USDE", "PYUSD", "EUR", "GBP", "AEUR", "USD1", "WBETH",
 }
 
+# ---------- فلتر العملات المتوافقة شرعيًا (اختياري) ----------
+# المصدر: Shariyah Review Bureau — https://shariyah.net/our-regulatory-status/
+# دي تصنيفات المصدر نفسه، مش رأي شرعي من عندنا، وتواريخ التقييم
+# متفاوتة (2021-2025) — يعني القايمة محتاجة مراجعة دورية يدوية، وأي
+# عملة جديدة أو ماتقيّمتش من المصدر ده مش هتظهر هنا تلقائيًا (نهج
+# "allow-list": لو العملة مش في القايمة، بنستبعدها افتراضيًا، بدل
+# ما نفترض إنها حلال لغياب تقييم).
+SHARIAH_COMPLIANT_BASES = {
+    "BTC", "BNB", "ADA", "ETH", "XRP", "XLM", "USDT", "ALGO",
+    "AVAX", "DOGE", "LTC", "DOT", "MATIC", "XTZ", "USDC", "SOL",
+    "BUSD", "LINK", "ETC", "UNI", "ATOM", "FIL", "HNT", "ICP",
+    "XMR", "NEAR", "THETA", "TON", "TRX", "SUI",
+}
+
+# شغّلها True عشان السكانر يبعت بس من العملات دي، أو False يرجع
+# للمسح الكامل زي الأول. ملحوظة: تفعيلها هيقلل عدد الإشارات بشكل
+# واضح، لأن معظم القفزات الكبيرة (30%+) بتحصل في عملات صغيرة
+# مش موجودة في القايمة دي أصلًا.
+SHARIAH_FILTER_ENABLED = True
+
 
 def get_symbols():
     data = get_json("/api/v3/exchangeInfo")
@@ -207,6 +227,9 @@ def get_symbols():
 
         base = symbol[:-4]  # إزالة "USDT" من آخر الاسم
         if base in STABLECOIN_BASES:
+            continue
+
+        if SHARIAH_FILTER_ENABLED and base not in SHARIAH_COMPLIANT_BASES:
             continue
 
         symbols.append(symbol)
