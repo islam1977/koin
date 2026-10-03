@@ -71,7 +71,10 @@ MIN_PRICE_CONFIRM_1H = 3.0
 
 
 def has_price_confirmation(x):
-    return x["15m"] >= MIN_PRICE_CONFIRM_15M or x["1h"] >= MIN_PRICE_CONFIRM_1H
+    # السعر لازم يؤكد إن الحركة حقيقية، لكن من غير ما نطلب حركة كبيرة
+    # بالفعل؛ وإلا سنحوّل السكانر لمطاردة الحركة بعد فوات بدايتها.
+    return bool(x.get("price_confirmation") and x.get("continuation_quality"))
+
 
 # الدرجات
 WATCH_SCORE = 65
@@ -137,7 +140,7 @@ if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
           "النتائج هتظهر في الـ log بس من غير إرسال لتليجرام.")
 
 session = requests.Session()
-session.headers.update({"User-Agent": "Binance-Early-Pump-Scanner-V2/1.0"})
+session.headers.update({"User-Agent": "Binance-Early-Pump-Scanner-V3/1.0"})
 
 
 def get_json(path, params=None):
@@ -204,7 +207,7 @@ SHARIAH_COMPLIANT_BASES = {
 # للمسح الكامل زي الأول. ملحوظة: تفعيلها هيقلل عدد الإشارات بشكل
 # واضح، لأن معظم القفزات الكبيرة (30%+) بتحصل في عملات صغيرة
 # مش موجودة في القايمة دي أصلًا.
-SHARIAH_FILTER_ENABLED = True
+SHARIAH_FILTER_ENABLED = False  # التحليل الجديد: لا نستبعد العملات غير الموجودة في القائمة تلقائيًا
 
 
 def get_symbols():
@@ -270,6 +273,61 @@ def mean(values):
     return sum(values) / len(values) if values else 0.0
 
 
+
+def ema(values, period):
+    """EMA بسيط بدون مكتبات إضافية."""
+    if len(values) < period:
+        return None
+    k = 2.0 / (period + 1)
+    e = sum(values[:period]) / period
+    for v in values[period:]:
+        e = v * k + e * (1 - k)
+    return e
+
+
+def rsi(values, period=14):
+    if len(values) < period + 1:
+        return None
+    gains = []
+    losses = []
+    for i in range(1, len(values)):
+        d = values[i] - values[i-1]
+        gains.append(max(d, 0))
+        losses.append(max(-d, 0))
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def atr_pct(highs, lows, closes, period=14):
+    if len(closes) < period + 1:
+        return None
+    trs = []
+    for i in range(1, len(closes)):
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i-1]),
+            abs(lows[i] - closes[i-1]),
+        )
+        trs.append(tr)
+    atr = sum(trs[:period]) / period
+    for tr in trs[period:]:
+        atr = (atr * (period - 1) + tr) / period
+    return (atr / closes[-1] * 100.0) if closes[-1] else None
+
+
+def pct_slope(values):
+    if len(values) < 2 or values[0] == 0:
+        return 0.0
+    return (values[-1] / values[0] - 1.0) * 100.0
+
+
 def analyze(symbol, ticker):
     try:
         klines = get_json(
@@ -285,10 +343,12 @@ def analyze(symbol, ticker):
     # الشمعة الحالية غير المكتملة لا تدخل في الحساب.
     k = klines[:-1]
 
+    opens = [float(x[1]) for x in k]
     closes = [float(x[4]) for x in k]
     highs = [float(x[2]) for x in k]
     lows = [float(x[3]) for x in k]
     quote_volumes = [float(x[7]) for x in k]
+    taker_buy_quote_volumes = [float(x[10]) for x in k]
 
     price = closes[-1]
 
@@ -349,98 +409,242 @@ def analyze(symbol, ticker):
     else:
         close_location = 0.5
 
-    # ---------- Score ----------
+    # ---------- Trend / momentum / volatility ----------
+    ema9 = ema(closes, 9)
+    ema21 = ema(closes, 21)
+    ema50 = ema(closes, 50)
+    rsi14 = rsi(closes, 14)
+    atr14_pct = atr_pct(highs, lows, closes, 14)
+
+    ema9_slope_15m = pct_slope(closes[-4:]) if len(closes) >= 4 else 0.0
+    ema21_slope_1h = pct_slope(closes[-13:]) if len(closes) >= 13 else 0.0
+
+    trend_bullish = (
+        ema9 is not None and ema21 is not None and
+        price > ema9 > ema21
+    )
+    trend_strong = (
+        trend_bullish and ema50 is not None and price > ema50
+    )
+
+    # Buy-pressure proxy: taker-buy quote volume / total quote volume.
+    current_buy = sum(taker_buy_quote_volumes[-3:])
+    current_total = sum(quote_volumes[-3:])
+    buy_pressure_15m = current_buy / current_total if current_total else 0.5
+
+    prev_buy = sum(taker_buy_quote_volumes[-6:-3])
+    prev_total = sum(quote_volumes[-6:-3])
+    prev_buy_pressure = prev_buy / prev_total if prev_total else 0.5
+
+    buy_pressure_delta = buy_pressure_15m - prev_buy_pressure
+
+    # شمعة 5m الحالية: جسم قوي وإغلاق قريب من القمة = ضغط شراء أفضل.
+    body_pct = pct(closes[-1], opens[-1]) if opens[-1] else 0.0
+    upper_wick = highs[-1] - max(opens[-1], closes[-1])
+    candle_range_abs = highs[-1] - lows[-1]
+    upper_wick_ratio = upper_wick / candle_range_abs if candle_range_abs else 0.0
+
+    # ---------- Early-opportunity score ----------
+    # الهدف هنا ليس قياس "قوة الحركة الحالية"؛ بل جودة فرصة ما زالت مبكرة.
+    # حجم التداول = اهتمام، وليس شراء بحد ذاته. الحركة الزائدة/الـwick الكبير
+    # يعاقبان لأنهما قد يعنيان أننا وصلنا متأخرين.
+    previous_15m = sum(quote_volumes[-6:-3])
+    prev_prev_15m = sum(quote_volumes[-9:-6])
+    prior_acceleration = previous_15m / prev_prev_15m if prev_prev_15m else 0.0
+    volume_persistence = min(volume_ratio_15m, volume_ratio_1h)
+
+    recent_high_1h = max(highs[-13:-1])
+    distance_from_1h_high = pct(price, recent_high_1h) if recent_high_1h else 0.0
+    efficiency = abs(gain_15m) / max(volume_ratio_15m, 1.0) if volume_ratio_15m else 0.0
+
+    # Score من 0 إلى 100، لكن عتبة FINAL صعبة عمدًا.
     score = 0
 
-    # تم رفع أعلى درجة للحجم من 30 إلى 35 بناءً على تحليل backtest على آخر
-    # 30 يوم: vol_ratio_1h كان أقوى مقياس فارق فعليًا قبل القفزات
-    # (حجم أثر +0.98 قبل ساعة واحدة من القفزة)، وده أقوى بكتير من أي
-    # مقياس تاني في السكانر.
+    # 1) Abnormal volume: دليل اهتمام، وليس إشارة شراء مستقلة.
     if volume_ratio_1h >= 6:
-        score += 35
+        score += 18
     elif volume_ratio_1h >= 4:
-        score += 30
-    elif volume_ratio_1h >= 2:
-        score += 20
-    elif volume_ratio_1h >= 1.5:
-        score += 10
-
-    if acceleration >= 2.5:
-        score += 20
-    elif acceleration >= 1.5:
-        score += 12
-    elif acceleration >= 1.2:
+        score += 15
+    elif volume_ratio_1h >= 2.5:
+        score += 11
+    elif volume_ratio_1h >= 1.7:
         score += 6
 
-    if 2 <= gain_15m <= 8:
-        score += 15
-    elif 0 <= gain_15m < 2:
-        score += 7
-    elif 8 < gain_15m <= 10:
-        score += 5
-
-    # تم تقليل وزن الاختراق من 20/10 إلى 10/5 بناءً على تحليل backtest:
-    # العملات قبل القفزة الفعلية كانت في المتوسط أبعد عن قمتها الأخيرة
-    # بـ~10% (مقابل ~7% في الأوقات العادية) — يعني القرب من كسر القمة
-    # مش مؤشر مبكر قوي زي ما كان مفترض، فقللنا اعتماد السكور عليه
-    # لحد ما تتجمع بيانات أكتر تأكد الاتجاه ده.
-    if breakout_pct >= 0:
-        score += 10
-    elif breakout_pct >= -1.5:
-        score += 5
-
-    if close_location >= 0.75:
-        score += 10
-    elif close_location >= 0.60:
-        score += 5
-
-    # ما زلنا في المنطقة المبكرة
-    if 0 <= gain_24h <= 8:
-        score += 5
-    elif gain_24h <= 14:
+    if volume_ratio_15m >= 10:
+        score += 12
+    elif volume_ratio_15m >= 6:
+        score += 9
+    elif volume_ratio_15m >= 3:
+        score += 6
+    elif volume_ratio_15m >= 2:
         score += 3
-    elif gain_24h <= 18:
+
+    # 2) استمرار الحجم أهم من spike واحد.
+    if volume_persistence >= 3:
+        score += 6
+    elif volume_persistence >= 2:
+        score += 4
+    elif volume_persistence >= 1.5:
+        score += 2
+
+    if acceleration >= 3 and prior_acceleration >= 1.2:
+        score += 6
+    elif acceleration >= 2:
+        score += 4
+    elif acceleration >= 1.3:
+        score += 2
+
+    # 3) Earlyness: نكافئ الحركة المتوسطة، لا الحركة التي قطعت شوطًا كبيرًا.
+    if 0.5 <= gain_15m <= 4:
+        score += 12
+    elif 0 <= gain_15m < 0.5:
+        score += 8
+    elif 4 < gain_15m <= 6:
+        score += 6
+    elif 6 < gain_15m <= 10:
         score += 1
 
-    # ---------- Liquidity score ----------
+    if 0.5 <= gain_1h <= 5:
+        score += 8
+    elif 0 <= gain_1h < 0.5:
+        score += 5
+    elif 5 < gain_1h <= 8:
+        score += 4
+    elif 8 < gain_1h <= 12:
+        score += 1
+
+    # 4) Price/volume efficiency: حجم كبير مع حركة سعر مضبوطة أفضل من
+    # حجم كبير بعد قفزة سعرية بالفعل.
+    if 0.05 <= efficiency <= 1.25:
+        score += 6
+    elif efficiency <= 2:
+        score += 2
+    elif efficiency > 3:
+        score -= 5
+
+    # 5) Trend structure.
+    if trend_strong:
+        score += 7
+    elif trend_bullish:
+        score += 4
+    elif ema9 is not None and ema21 is not None and ema9 < ema21:
+        score -= 3
+
+    if ema9_slope_15m > 0.3 and ema21_slope_1h > 0.5:
+        score += 4
+    elif ema9_slope_15m < -0.5 or ema21_slope_1h < -1.0:
+        score -= 4
+
+    # 6) Buy pressure يدعم الاستمرار، لكنه ليس predictor منفرد.
+    if buy_pressure_15m >= 0.62 and buy_pressure_delta >= 0.02:
+        score += 7
+    elif buy_pressure_15m >= 0.56:
+        score += 4
+    elif buy_pressure_15m < 0.45:
+        score -= 6
+
+    # 7) Breakout = سياق فقط. لا نكافئ كسرًا كبيرًا كأنه بداية مؤكدة.
+    if -1.0 <= breakout_pct <= 1.5:
+        score += 5
+    elif 1.5 < breakout_pct <= 3:
+        score += 2
+    elif breakout_pct > 4:
+        score -= 4
+    elif breakout_pct < -3:
+        score -= 2
+
+    # 8) Exhaustion / rejection filter.
+    if upper_wick_ratio > 0.35 and body_pct < 0.5:
+        score -= 5
+    elif close_location >= 0.75 and body_pct > 0:
+        score += 3
+
+    if rsi14 is not None:
+        if 50 <= rsi14 <= 68:
+            score += 4
+        elif 68 < rsi14 <= 78:
+            score += 1
+        elif rsi14 > 85:
+            score -= 7
+        elif rsi14 < 42:
+            score -= 4
+
+    if atr14_pct is not None:
+        if 0.4 <= atr14_pct <= 5:
+            score += 2
+        elif atr14_pct > 8:
+            score -= 3
+
+    # 9) 24h context: الصعود البسيط مقبول، الارتفاع الكبير يقلل earlyness.
+    if 0 <= gain_24h <= 8:
+        score += 4
+    elif gain_24h < 0:
+        score += 2
+    elif gain_24h <= 14:
+        score += 1
+    elif gain_24h > 20:
+        score -= 3
+
+    # 10) Liquidity = جودة تنفيذ، وليست احتمال pump.
     if qv24 >= 20_000_000:
         liquidity = "HIGH"
-        liquidity_points = 5
+        liquidity_points = 4
     elif qv24 >= 10_000_000:
         liquidity = "GOOD"
-        liquidity_points = 4
+        liquidity_points = 3
     elif qv24 >= 5_000_000:
         liquidity = "MEDIUM"
-        liquidity_points = 2
+        liquidity_points = 1
     else:
         liquidity = "LOW"
         liquidity_points = 0
-
     score += liquidity_points
 
-    # Smart Early Pump: حجم انفجر فجأة والسعر لسه ما تحركش كتير ولسه
-    # تحت القمة — نمط "العملة جاهزة تتحرك بس الحركة الكبيرة ماحصلتش
-    # بعد"، وده أقرب حالة لنوع الفرص اللي بتتفوّت حاليًا (زي MOVR وهي
-    # لسه في أول حركتها). بيتفحص قبل الأنماط التانية لأنه الأكثر تحديدًا.
+    # Late-entry penalty.
+    if gain_15m > 7 or gain_1h > 10:
+        score -= 8
+    if gain_15m > 8.5 and gain_1h > 12:
+        score -= 10
+
+    score = max(0, min(int(round(score)), 100))
+
+    # ---------- Setup classification ----------
     if (
-        volume_ratio_15m >= 8
-        and acceleration >= 3
-        and 1.0 <= gain_15m <= 8.0
-        and gain_24h < 25.0
+        volume_ratio_15m >= 5
+        and volume_ratio_1h >= 2
+        and acceleration >= 1.5
+        and 0.5 <= gain_15m <= 6
+        and gain_1h <= 8
+        and buy_pressure_15m >= 0.54
+        and (rsi14 is None or rsi14 < 80)
     ):
         setup = "SMART EARLY PUMP"
     elif (
-        breakout_pct >= 0
+        breakout_pct >= -1
         and volume_ratio_1h >= 2
         and acceleration >= 1.5
+        and gain_15m <= 6
     ):
         setup = "BREAKOUT + VOLUME ACCELERATION"
-    elif volume_ratio_1h >= 3 and acceleration >= 1.5:
+    elif volume_ratio_1h >= 3 and volume_persistence >= 2:
         setup = "VOLUME EXPANSION"
     elif breakout_pct >= 0:
         setup = "BREAKOUT"
     else:
         setup = "EARLY MOMENTUM"
+
+    # Final gate: لا يكفي score مرتفع؛ لازم السعر يؤكد الاستمرار بدون exhaustion.
+    price_confirmation = (
+        gain_15m >= 1.0
+        or gain_1h >= 2.0
+        or (breakout_pct >= -1.0 and close_location >= 0.70)
+    )
+    continuation_quality = (
+        buy_pressure_15m >= 0.52
+        and (rsi14 is None or rsi14 < 82)
+        and upper_wick_ratio < 0.50
+        and not (gain_15m > 8 and gain_1h > 12)
+    )
 
     return {
         "symbol": symbol,
@@ -458,7 +662,22 @@ def analyze(symbol, ticker):
         "score": score,
         "setup": setup,
         "quote_volume": qv24,
-        "liquidity": liquidity
+        "liquidity": liquidity,
+        "ema9": ema9,
+        "ema21": ema21,
+        "ema50": ema50,
+        "rsi14": rsi14,
+        "atr_pct": atr14_pct,
+        "buy_pressure": buy_pressure_15m,
+        "buy_pressure_delta": buy_pressure_delta,
+        "body_pct": body_pct,
+        "upper_wick_ratio": upper_wick_ratio,
+        "trend": "STRONG_UP" if trend_strong else ("UP" if trend_bullish else "NEUTRAL"),
+        "distance_from_1h_high": distance_from_1h_high,
+        "volume_persistence": volume_persistence,
+        "efficiency": efficiency,
+        "price_confirmation": price_confirmation,
+        "continuation_quality": continuation_quality,
     }
 
 
@@ -723,18 +942,13 @@ def format_final(x, confirmations, cross_label=None, cross_detail=None):
         emoji = CROSS_LABEL_EMOJI.get(cross_label, "")
         cross_section = f"\nCross-exchange check: {emoji} {cross_label}\n{cross_detail}\n"
 
-    entry = x["price"]
-    stop_loss = entry * (1 - STOP_LOSS_PCT / 100)
-    take_profit_1 = entry * (1 + TAKE_PROFIT_1_PCT / 100)
-    take_profit_2 = entry * (1 + TAKE_PROFIT_2_PCT / 100)
-
     return f"""🔥 FINAL EARLY-PUMP CANDIDATE
 
-⚠️ هذه إشارة تحليلية وليست ضمانًا أو أمر شراء.
+⚠️ إشارة تحليلية مبنية على نموذج early-opportunity، وليست ضمانًا أو أمر شراء.
 
 COIN: {x['symbol']}
 SETUP: {x['setup']}
-SCORE: {x['score']}/100
+EARLY SCORE: {x['score']}/100
 
 Price at final signal:
 {x['price']:.12g}
@@ -747,28 +961,35 @@ Price at final signal:
 Volume 1h: {x['volume_1h']:.2f}x
 Volume 15m: {x['volume_15m']:.2f}x
 Acceleration: {x['acceleration']:.2f}x
+Volume persistence: {x.get('volume_persistence', 0):.2f}x
+
+Trend: {x.get('trend', 'N/A')}
+EMA9/EMA21: {x.get('ema9', 0):.8g} / {x.get('ema21', 0):.8g}
+RSI14: {x.get('rsi14') if x.get('rsi14') is not None else 0:.1f}
+ATR14: {x.get('atr_pct') if x.get('atr_pct') is not None else 0:.2f}%
+Buy pressure: {x.get('buy_pressure', 0):.2f}
+Buy pressure Δ: {x.get('buy_pressure_delta', 0):+.3f}
+Candle body: {x.get('body_pct', 0):+.2f}%
+Upper wick: {x.get('upper_wick_ratio', 0) * 100:.1f}% of range
 
 Breakout: {x['breakout']:+.2f}%
+Distance from 1h high: {x.get('distance_from_1h_high', 0):+.2f}%
 Liquidity: {x['liquidity']}
 24h Volume: ${x['quote_volume']:,.0f}
 
 Confirmation scans: {confirmations}
 {cross_section}
-💰 مستويات مقترحة (نسب ثابتة، مش تحليل تذبذب دقيق):
-Entry: {entry:.12g}
-🎯 Target 1 (+{TAKE_PROFIT_1_PCT:.0f}%): {take_profit_1:.12g}
-🎯 Target 2 (+{TAKE_PROFIT_2_PCT:.0f}%): {take_profit_2:.12g}
-🛑 Stop-loss (-{STOP_LOSS_PCT:.0f}%): {stop_loss:.12g}
-
 📌 لماذا ظهرت؟
-السعر + الحجم + تسارع الحجم + الاختراق
-اجتمعت في نفس الوقت.
+حجم غير طبيعي + استمرار حجم + حركة سعر ما زالت محدودة نسبيًا
++ اتجاه/ضغط شراء + فلتر ضد الـexhaustion.
 
-📊 سيتم الآن تتبع النتيجة تلقائيًا:
+🚫 لا يوجد Target ثابت +25%/+30% في هذه النسخة.
+الهدف الثابت كان يوحي بقدرة على توقع مسافة الحركة، بينما النموذج
+الحالي يقيس جودة البداية فقط. سيتم قياس MFE / MAE فعليًا بعد الإشارة.
+
+📊 سيتم الآن تتبع النتيجة:
 5m / 15m / 30m / 1h / 4h / 24h
 
-⚠️ المستويات دي مبنية على نسبة ثابتة بسيطة، مش توصية مالية ولا
-ضمان ربح. قرار الدخول والخروج ومقدار المخاطرة بتاعك إنت.
 لا يوجد تداول آلي في هذه النسخة.
 """
 
@@ -803,9 +1024,8 @@ def maybe_final_signal(x, now):
         if now - final_cooldown[symbol] < FINAL_COOLDOWN_HOURS * 3600:
             return False
 
-    # فقط الإشارات القوية تدخل مرحلة التأكيد.
-    if x["score"] < FINAL_SCORE:
-        # تنظيف مرشح قديم
+    # لا ندخل confirmation إلا إذا score + price gate اجتمعوا.
+    if x["score"] < FINAL_SCORE or not has_price_confirmation(x):
         c = candidates.get(symbol)
         if c and (now - c["last_ts"]) > CANDIDATE_EXPIRY_MINUTES * 60:
             del candidates[symbol]
@@ -814,73 +1034,72 @@ def maybe_final_signal(x, now):
     c = candidates.get(symbol)
 
     if not c:
-        c = {
+        candidates[symbol] = {
             "count": 1,
             "first_ts": now,
             "last_ts": now,
-            "best": x
+            "best": x,
+            "first": x,
         }
-        candidates[symbol] = c
-        # باج كان موجود هنا: كان بيرجع False فورًا حتى لو score وصل
-        # EXCEPTIONAL_SCORE من أول مرة، يعني "إشارة قوية تتبعت من دورة
-        # واحدة" ماكانتش بتشتغل عمليًا أبدًا (كان المفروض يستنى CONFIRMATIONS_REQUIRED
-        # دايمًا، حتى لو الشرط exceptional كان True). دلوقتي أول حدوث
-        # يكمّل للفحص تحت بدل ما يرجع فورًا.
-    else:
-        # يجب أن تكون الدورة التالية قريبة زمنيًا.
-        if now - c["last_ts"] <= CANDIDATE_EXPIRY_MINUTES * 60:
-            c["count"] += 1
-            c["last_ts"] = now
-            if x["score"] > c["best"]["score"]:
-                c["best"] = x
-        else:
-            c = {
-                "count": 1,
-                "first_ts": now,
-                "last_ts": now,
-                "best": x
-            }
-            candidates[symbol] = c
+        return False
 
-    # تأكيد عادي: دورتان متتاليتان.
-    confirmed = c["count"] >= CONFIRMATIONS_REQUIRED
+    if now - c["last_ts"] > CANDIDATE_EXPIRY_MINUTES * 60:
+        candidates[symbol] = {
+            "count": 1,
+            "first_ts": now,
+            "last_ts": now,
+            "best": x,
+            "first": x,
+        }
+        return False
 
-    # أو إشارة استثنائية جدًا.
-    exceptional = x["score"] >= EXCEPTIONAL_SCORE
+    c["count"] += 1
+    c["last_ts"] = now
+    if x["score"] > c["best"]["score"]:
+        c["best"] = x
 
-    if confirmed or exceptional:
-        final_x = x if x["score"] >= c["best"]["score"] else c["best"]
+    first = c["first"]
+    second_confirmed = (
+        x["score"] >= FINAL_SCORE
+        and has_price_confirmation(x)
+        and x.get("continuation_quality", False)
+        and x["5m"] > -0.5
+        and x["15m"] >= first["15m"] - 1.0
+        and x["volume_1h"] >= first["volume_1h"] * 0.70
+    )
 
-        # تأكيد عبر Bybit وOKX — بس للمرشحين اللي وصلوا هنا فعلاً،
-        # مش لكل عملة بتتفحص، عشان ما يبطأش السكانر.
-        cross_label, cross_detail = cross_exchange_confirmation(symbol)
+    # لا يوجد bypass للـconfirmation حتى لو score = 90 أو 100.
+    if c["count"] < CONFIRMATIONS_REQUIRED or not second_confirmed:
+        return False
 
-        if SUPPRESS_ON_DIVERGENCE and cross_label == "DIVERGENCE":
-            print(f"\n[Cross-exchange] {symbol}: DIVERGENCE — FINAL اتمنع. {cross_detail}")
-            final_cooldown[symbol] = now
-            candidates.pop(symbol, None)
-            return False
+    final_x = x if x["score"] >= c["best"]["score"] else c["best"]
 
+    cross_label, cross_detail = cross_exchange_confirmation(symbol)
+
+    if SUPPRESS_ON_DIVERGENCE and cross_label == "DIVERGENCE":
+        print(f"\n[Cross-exchange] {symbol}: DIVERGENCE — FINAL اتمنع. {cross_detail}")
         final_cooldown[symbol] = now
         candidates.pop(symbol, None)
+        return False
 
-        message = format_final(
-            final_x,
-            c["count"],
-            cross_label=cross_label,
-            cross_detail=cross_detail,
-        )
+    final_cooldown[symbol] = now
+    candidates.pop(symbol, None)
 
-        telegram_send(message)
+    message = format_final(
+        final_x,
+        c["count"],
+        cross_label=cross_label,
+        cross_detail=cross_detail,
+    )
 
-        print("\n" + "!" * 70)
-        print(message)
-        print("!" * 70)
+    telegram_send(message)
 
-        start_final_tracking(final_x)
-        return True
+    print("\n" + "!" * 70)
+    print(message)
+    print("!" * 70)
 
-    return False
+    start_final_tracking(final_x)
+    return True
 
 
 # ============================================================
@@ -912,7 +1131,12 @@ def load_state():
         print("Could not read state:", e)
         return
 
-    candidates.update(state.get("candidates", {}))
+    # state القديم من V2/V3 ممكن ما يكونش فيه first/metrics المطلوبة للـconfirmation الجديد؛
+    # نحتفظ بالـcooldown والتتبع، لكن نعيد المرشحات القديمة من الصفر بدل crash.
+    for sym, cand in state.get("candidates", {}).items():
+        if isinstance(cand, dict) and "first" in cand and "best" in cand:
+            candidates[sym] = cand
+
     final_cooldown.update(state.get("final_cooldown", {}))
     early_watch_logged.update(state.get("early_watch_logged", {}))
 
@@ -981,6 +1205,9 @@ def run_cycle(symbols):
                 f"Vol15m={x['volume_15m']:5.2f}x "
                 f"Accel={x['acceleration']:4.2f}x "
                 f"Break={x['breakout']:+5.2f}% "
+                f"Buy={x.get('buy_pressure', 0):.2f} "
+                f"RSI={x.get('rsi14') or 0:4.1f} "
+                f"Trend={x.get('trend','-')} "
                 f"Liquidity={x['liquidity']}"
             )
 
