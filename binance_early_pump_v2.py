@@ -20,6 +20,7 @@
 import requests, time, math, csv, os, json, sys
 import pandas as pd
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # data-api.binance.vision = عنوان Binance الرسمي لبيانات السوق العامة فقط (مفيش تداول).
@@ -61,6 +62,37 @@ MAX_1H_GAIN = 18.0
 STOP_LOSS_PCT = 8.0        # وقف خسارة تحت سعر الدخول
 TAKE_PROFIT_1_PCT = 25.0   # هدف أول: مكسب جيد وواقعي
 TAKE_PROFIT_2_PCT = 30.0   # هدف ثاني: لو الزخم استمر
+
+# ---------- مستويات ديناميكية مبنية على ATR14 ----------
+# هذه المستويات للعرض فقط في Telegram، ولا تنفذ أي أمر تداول.
+ATR_STOP_MULTIPLIER = 1.50
+MIN_STOP_DISTANCE_PCT = 1.50
+MAX_STOP_DISTANCE_PCT = 6.00
+TP1_R = 1.50
+TP2_R = 2.50
+TP3_R = 4.00
+CAIRO_TZ = ZoneInfo("Africa/Cairo")
+
+def cairo_now():
+    return datetime.now(timezone.utc).astimezone(CAIRO_TZ)
+
+def cairo_timestamp():
+    return cairo_now().strftime("%Y-%m-%d %H:%M:%S")
+
+def build_trade_levels(price, atr_pct_value):
+    atr = float(atr_pct_value or 0.0)
+    stop_pct = max(MIN_STOP_DISTANCE_PCT, atr * ATR_STOP_MULTIPLIER)
+    stop_pct = min(MAX_STOP_DISTANCE_PCT, stop_pct)
+    risk = price * stop_pct / 100.0
+    return {
+        "entry": price,
+        "stop_loss": price - risk,
+        "stop_pct": stop_pct,
+        "tp1": price + risk * TP1_R,
+        "tp2": price + risk * TP2_R,
+        "tp3": price + risk * TP3_R,
+    }
+
 
 # تأكيد حركة سعر حقيقية قبل أي FINAL (بغض النظر عن الـ Score):
 # لازم واحد من الاتنين يتحقق على الأقل. ده بيمنع إن حجم تداول ضخم
@@ -207,7 +239,7 @@ SHARIAH_COMPLIANT_BASES = {
 # للمسح الكامل زي الأول. ملحوظة: تفعيلها هيقلل عدد الإشارات بشكل
 # واضح، لأن معظم القفزات الكبيرة (30%+) بتحصل في عملات صغيرة
 # مش موجودة في القايمة دي أصلًا.
-SHARIAH_FILTER_ENABLED = False  # التحليل الجديد: لا نستبعد العملات غير الموجودة في القائمة تلقائيًا
+SHARIAH_FILTER_ENABLED = False  # V3: لا نستبعد العملات غير الموجودة في القائمة تلقائيًا
 
 
 def get_symbols():
@@ -608,6 +640,36 @@ def analyze(symbol, ticker):
 
     score = max(0, min(int(round(score)), 100))
 
+    # ---------- Hard gates ضد الإشارات الكاذبة ----------
+    stable_or_flat = (
+        (atr14_pct is not None and atr14_pct < 0.05)
+        or (abs(gain_5m) < 0.03 and abs(gain_15m) < 0.08 and abs(gain_1h) < 0.15)
+    )
+
+    exhaustion_flag = (
+        (rsi14 is not None and rsi14 >= 80 and upper_wick_ratio >= 0.35
+         and buy_pressure_delta < 0 and breakout_pct < 0)
+        or (rsi14 is not None and rsi14 >= 75 and upper_wick_ratio >= 0.40
+            and buy_pressure_delta <= -0.05)
+        or (rsi14 is not None and rsi14 >= 75 and gain_5m < 0
+            and breakout_pct < -0.50 and buy_pressure_delta <= 0)
+    )
+
+    volume_without_price = (
+        volume_ratio_1h >= 8 and volume_ratio_15m >= 6
+        and gain_15m < 0.75 and breakout_pct < 0
+        and body_pct <= 0.30
+    )
+
+    hard_block = stable_or_flat or exhaustion_flag or volume_without_price
+    block_reasons = []
+    if stable_or_flat:
+        block_reasons.append("FLAT/LOW-VOLATILITY")
+    if exhaustion_flag:
+        block_reasons.append("EXHAUSTION")
+    if volume_without_price:
+        block_reasons.append("VOLUME_WITHOUT_PRICE")
+
     # ---------- Setup classification ----------
     if (
         volume_ratio_15m >= 5
@@ -678,6 +740,9 @@ def analyze(symbol, ticker):
         "efficiency": efficiency,
         "price_confirmation": price_confirmation,
         "continuation_quality": continuation_quality,
+        "hard_block": hard_block,
+        "block_reason": ", ".join(block_reasons) if block_reasons else "",
+        "trade_levels": build_trade_levels(price, atr14_pct),
     }
 
 
@@ -942,9 +1007,13 @@ def format_final(x, confirmations, cross_label=None, cross_detail=None):
         emoji = CROSS_LABEL_EMOJI.get(cross_label, "")
         cross_section = f"\nCross-exchange check: {emoji} {cross_label}\n{cross_detail}\n"
 
+    levels = x.get("trade_levels") or build_trade_levels(x["price"], x.get("atr_pct"))
+    signal_time_cairo = cairo_timestamp()
     return f"""🔥 FINAL EARLY-PUMP CANDIDATE
 
 ⚠️ إشارة تحليلية مبنية على نموذج early-opportunity، وليست ضمانًا أو أمر شراء.
+
+🕒 وقت الإرسال — القاهرة: {signal_time_cairo}
 
 COIN: {x['symbol']}
 SETUP: {x['setup']}
@@ -983,9 +1052,15 @@ Confirmation scans: {confirmations}
 حجم غير طبيعي + استمرار حجم + حركة سعر ما زالت محدودة نسبيًا
 + اتجاه/ضغط شراء + فلتر ضد الـexhaustion.
 
-🚫 لا يوجد Target ثابت +25%/+30% في هذه النسخة.
-الهدف الثابت كان يوحي بقدرة على توقع مسافة الحركة، بينما النموذج
-الحالي يقيس جودة البداية فقط. سيتم قياس MFE / MAE فعليًا بعد الإشارة.
+🎯 مستويات إرشادية من ATR14 — ليست أوامر تداول:
+💰 دخول مرجعي: {levels['entry']:.12g}
+🛑 وقف خسارة: {levels['stop_loss']:.12g}  (-{levels['stop_pct']:.2f}%)
+🥅 TP1: {levels['tp1']:.12g}  (+{TP1_R:.1f}R)
+🥅 TP2: {levels['tp2']:.12g}  (+{TP2_R:.1f}R)
+🥅 TP3: {levels['tp3']:.12g}  (+{TP3_R:.1f}R)
+
+المستويات محسوبة من سعر الإشارة وATR14 لتناسب تذبذب العملة،
+وليست ضمانًا للوصول إليها. لا يوجد تداول آلي.
 
 📊 سيتم الآن تتبع النتيجة:
 5m / 15m / 30m / 1h / 4h / 24h
@@ -1024,7 +1099,10 @@ def maybe_final_signal(x, now):
         if now - final_cooldown[symbol] < FINAL_COOLDOWN_HOURS * 3600:
             return False
 
-    # لا ندخل confirmation إلا إذا score + price gate اجتمعوا.
+    # لا ندخل confirmation إلا إذا score + price gate + hard gates اجتمعوا.
+    if x.get("hard_block", False):
+        print(f"[HARD BLOCK] {symbol}: {x.get('block_reason', '')}")
+        return False
     if x["score"] < FINAL_SCORE or not has_price_confirmation(x):
         c = candidates.get(symbol)
         if c and (now - c["last_ts"]) > CANDIDATE_EXPIRY_MINUTES * 60:
@@ -1221,7 +1299,7 @@ def run_cycle(symbols):
             # نفسه بيتحرك فعلاً (مش بس الحجم)، عشان نتجنب حالات زي
             # DODOUSDT/MEMEUSDT اللي وصلت Score 80+ بسبب حجم ضخم
             # بينما السعر كان شبه ثابت أو نازل.
-            if x["score"] >= FINAL_SCORE and has_price_confirmation(x):
+            if x["score"] >= FINAL_SCORE and has_price_confirmation(x) and not x.get("hard_block", False):
                 maybe_final_signal(x, now)
 
     print(f"\nActive final tracks: {len(active_tracks)}")
