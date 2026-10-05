@@ -20,7 +20,6 @@
 import requests, time, math, csv, os, json, sys
 import pandas as pd
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # data-api.binance.vision = عنوان Binance الرسمي لبيانات السوق العامة فقط (مفيش تداول).
@@ -63,37 +62,6 @@ STOP_LOSS_PCT = 8.0        # وقف خسارة تحت سعر الدخول
 TAKE_PROFIT_1_PCT = 25.0   # هدف أول: مكسب جيد وواقعي
 TAKE_PROFIT_2_PCT = 30.0   # هدف ثاني: لو الزخم استمر
 
-# ---------- مستويات ديناميكية مبنية على ATR14 ----------
-# هذه المستويات للعرض فقط في Telegram، ولا تنفذ أي أمر تداول.
-ATR_STOP_MULTIPLIER = 1.50
-MIN_STOP_DISTANCE_PCT = 1.50
-MAX_STOP_DISTANCE_PCT = 6.00
-TP1_R = 1.50
-TP2_R = 2.50
-TP3_R = 4.00
-CAIRO_TZ = ZoneInfo("Africa/Cairo")
-
-def cairo_now():
-    return datetime.now(timezone.utc).astimezone(CAIRO_TZ)
-
-def cairo_timestamp():
-    return cairo_now().strftime("%Y-%m-%d %H:%M:%S")
-
-def build_trade_levels(price, atr_pct_value):
-    atr = float(atr_pct_value or 0.0)
-    stop_pct = max(MIN_STOP_DISTANCE_PCT, atr * ATR_STOP_MULTIPLIER)
-    stop_pct = min(MAX_STOP_DISTANCE_PCT, stop_pct)
-    risk = price * stop_pct / 100.0
-    return {
-        "entry": price,
-        "stop_loss": price - risk,
-        "stop_pct": stop_pct,
-        "tp1": price + risk * TP1_R,
-        "tp2": price + risk * TP2_R,
-        "tp3": price + risk * TP3_R,
-    }
-
-
 # تأكيد حركة سعر حقيقية قبل أي FINAL (بغض النظر عن الـ Score):
 # لازم واحد من الاتنين يتحقق على الأقل. ده بيمنع إن حجم تداول ضخم
 # لوحده (من غير حركة سعر فعلية) يوصل لـFINAL، زي ما حصل مع
@@ -101,11 +69,143 @@ def build_trade_levels(price, atr_pct_value):
 MIN_PRICE_CONFIRM_15M = 1.5
 MIN_PRICE_CONFIRM_1H = 3.0
 
+# ---------- STRICT FINAL PUMP GATE ----------
+# الـFINAL هنا مخصص للانفجار السعري المبكر، وليس لأي عملة صاعدة.
+# لذلك لازم السعر نفسه يتحرك في 15m مع حجم قصير المدى وacceleration.
+FINAL_MIN_15M_MOVE = 1.25
+FINAL_MIN_5M_MOVE = 0.25
+FINAL_MIN_VOLUME_15M = 4.50
+FINAL_MIN_VOLUME_1H = 2.00
+FINAL_MIN_ACCELERATION = 2.50
+FINAL_MIN_24H_VOLUME = 3_000_000
+FINAL_MAX_24H_GAIN = 12.0
+FINAL_MAX_RSI = 79.5
+
+# ---------- EXPLOSIVE EARLY PATH ----------
+# مسار إضافي لا ينتظر 15m +1.25% إذا كان هناك تسارع سعري/حجمي
+# واضح جدًا. الهدف التقاط بداية الانفجار قبل أن تتحول العملة إلى
+# "late momentum"، مع إبقاء فلاتر البنية والـexhaustion.
+EXPLOSIVE_MIN_5M_MOVE = 0.70
+EXPLOSIVE_MIN_15M_MOVE = 0.40
+EXPLOSIVE_MIN_VOLUME_15M = 7.00
+EXPLOSIVE_MIN_VOLUME_1H = 2.00
+EXPLOSIVE_MIN_ACCELERATION = 3.00
+EXPLOSIVE_MIN_BUY_PRESSURE = 0.58
+EXPLOSIVE_MIN_24H_VOLUME = 3_000_000
+EXPLOSIVE_MAX_24H_GAIN = 15.0
+EXPLOSIVE_MAX_1H_GAIN = 8.0
+EXPLOSIVE_MAX_RSI = 78.0
+EXPLOSIVE_MAX_UPPER_WICK = 0.40
+EXPLOSIVE_MIN_BREAKOUT = -1.50
+
+STABLE_BASES = {
+    "USDT", "USDC", "FDUSD", "TUSD", "USDP", "DAI",
+    "USDE", "USD1", "RLUSD", "USDD", "EUR", "EURI", "USTC"
+}
+
+def explosive_early_gate(x):
+    """مسار التقاط بداية الانفجار بدون انتظار 15m +1.25%."""
+    symbol = x.get("symbol", "")
+    base = symbol[:-4] if symbol.endswith("USDT") else symbol
+    if base in STABLE_BASES:
+        return False
+
+    price_impulse = (
+        x.get("5m", -999) >= EXPLOSIVE_MIN_5M_MOVE
+        and x.get("15m", -999) >= EXPLOSIVE_MIN_15M_MOVE
+    )
+
+    acceleration_ok = (
+        x.get("volume_15m", 0) >= EXPLOSIVE_MIN_VOLUME_15M
+        and x.get("volume_1h", 0) >= EXPLOSIVE_MIN_VOLUME_1H
+        and x.get("acceleration", 0) >= EXPLOSIVE_MIN_ACCELERATION
+    )
+
+    structure_ok = (
+        x.get("buy_pressure", 0) >= EXPLOSIVE_MIN_BUY_PRESSURE
+        and x.get("upper_wick_ratio", 1.0) < EXPLOSIVE_MAX_UPPER_WICK
+        and x.get("breakout", -999) >= EXPLOSIVE_MIN_BREAKOUT
+        and x.get("rsi14") is not None
+        and x.get("rsi14") < EXPLOSIVE_MAX_RSI
+    )
+
+    early_ok = (
+        x.get("24h", 999) <= EXPLOSIVE_MAX_24H_GAIN
+        and x.get("1h", 999) <= EXPLOSIVE_MAX_1H_GAIN
+        and x.get("15m", 999) <= 4.0
+    )
+
+    liquidity_ok = x.get("quote_volume", 0) >= EXPLOSIVE_MIN_24H_VOLUME
+
+    return bool(price_impulse and acceleration_ok and structure_ok and early_ok and liquidity_ok)
+
+
+def strict_pump_gate(x):
+    symbol = x.get("symbol", "")
+    base = symbol[:-4] if symbol.endswith("USDT") else symbol
+    if base in STABLE_BASES:
+        return False
+
+    # لازم يكون فيه حركة سعرية قصيرة حقيقية.
+    price_ok = (
+        x.get("15m", -999) >= FINAL_MIN_15M_MOVE
+        and (
+            x.get("5m", -999) >= FINAL_MIN_5M_MOVE
+            or x.get("breakout", -999) >= 0.0
+        )
+    )
+
+    # لازم يكون الحجم القصير + التسارع غير عاديين.
+    volume_ok = (
+        x.get("volume_1h", 0) >= FINAL_MIN_VOLUME_1H
+        and (
+            (
+                x.get("volume_15m", 0) >= FINAL_MIN_VOLUME_15M
+                and x.get("acceleration", 0) >= FINAL_MIN_ACCELERATION
+            )
+            or (
+                x.get("15m", 0) >= 2.50
+                and x.get("5m", 0) >= 1.00
+                and x.get("volume_15m", 0) >= 8.00
+            )
+        )
+    )
+
+    structure_ok = (
+        x.get("buy_pressure", 0) >= 0.52
+        and x.get("upper_wick_ratio", 1.0) < 0.45
+        and x.get("breakout", -999) >= -0.75
+        and x.get("rsi14") is not None
+        and x.get("rsi14") < FINAL_MAX_RSI
+    )
+
+    # منع العملات التي تحركت بالفعل بدرجة تجعلنا نطاردها.
+    not_late = (
+        x.get("24h", 999) <= FINAL_MAX_24H_GAIN
+        and x.get("15m", 999) <= 6.0
+        and x.get("1h", 999) <= 10.0
+    )
+
+    liquidity_ok = x.get("quote_volume", 0) >= FINAL_MIN_24H_VOLUME
+
+    return bool(price_ok and volume_ok and structure_ok and not_late and liquidity_ok)
+
+MIN_PRICE_CONFIRM_15M = 1.5
+MIN_PRICE_CONFIRM_1H = 3.0
+
 
 def has_price_confirmation(x):
-    # السعر لازم يؤكد إن الحركة حقيقية، لكن من غير ما نطلب حركة كبيرة
-    # بالفعل؛ وإلا سنحوّل السكانر لمطاردة الحركة بعد فوات بدايتها.
-    return bool(x.get("price_confirmation") and x.get("continuation_quality"))
+    # مساران للـFINAL:
+    # 1) STRICT: الحركة بدأت بالفعل.
+    # 2) EXPLOSIVE EARLY: التسارع السعري/الحجمي قوي بما يكفي لالتقاط
+    #    بداية الانفجار قبل أن تصل 15m إلى +1.25%.
+    strict_ok = strict_pump_gate(x)
+    explosive_ok = explosive_early_gate(x)
+    return bool(
+        x.get("price_confirmation")
+        and x.get("continuation_quality")
+        and (strict_ok or explosive_ok)
+    )
 
 
 # الدرجات
@@ -239,7 +339,7 @@ SHARIAH_COMPLIANT_BASES = {
 # للمسح الكامل زي الأول. ملحوظة: تفعيلها هيقلل عدد الإشارات بشكل
 # واضح، لأن معظم القفزات الكبيرة (30%+) بتحصل في عملات صغيرة
 # مش موجودة في القايمة دي أصلًا.
-SHARIAH_FILTER_ENABLED = False  # V3: لا نستبعد العملات غير الموجودة في القائمة تلقائيًا
+SHARIAH_FILTER_ENABLED = False  # التحليل الجديد: لا نستبعد العملات غير الموجودة في القائمة تلقائيًا
 
 
 def get_symbols():
@@ -640,36 +740,6 @@ def analyze(symbol, ticker):
 
     score = max(0, min(int(round(score)), 100))
 
-    # ---------- Hard gates ضد الإشارات الكاذبة ----------
-    stable_or_flat = (
-        (atr14_pct is not None and atr14_pct < 0.05)
-        or (abs(gain_5m) < 0.03 and abs(gain_15m) < 0.08 and abs(gain_1h) < 0.15)
-    )
-
-    exhaustion_flag = (
-        (rsi14 is not None and rsi14 >= 80 and upper_wick_ratio >= 0.35
-         and buy_pressure_delta < 0 and breakout_pct < 0)
-        or (rsi14 is not None and rsi14 >= 75 and upper_wick_ratio >= 0.40
-            and buy_pressure_delta <= -0.05)
-        or (rsi14 is not None and rsi14 >= 75 and gain_5m < 0
-            and breakout_pct < -0.50 and buy_pressure_delta <= 0)
-    )
-
-    volume_without_price = (
-        volume_ratio_1h >= 8 and volume_ratio_15m >= 6
-        and gain_15m < 0.75 and breakout_pct < 0
-        and body_pct <= 0.30
-    )
-
-    hard_block = stable_or_flat or exhaustion_flag or volume_without_price
-    block_reasons = []
-    if stable_or_flat:
-        block_reasons.append("FLAT/LOW-VOLATILITY")
-    if exhaustion_flag:
-        block_reasons.append("EXHAUSTION")
-    if volume_without_price:
-        block_reasons.append("VOLUME_WITHOUT_PRICE")
-
     # ---------- Setup classification ----------
     if (
         volume_ratio_15m >= 5
@@ -694,6 +764,18 @@ def analyze(symbol, ticker):
         setup = "BREAKOUT"
     else:
         setup = "EARLY MOMENTUM"
+
+    # لو العملة تستوفي مسار EXPLOSIVE EARLY، نميزها صراحة في السجل
+    # والـTelegram بدل خلطها مع EARLY MOMENTUM العادي.
+    explosive_probe = {
+        "symbol": symbol, "5m": gain_5m, "15m": gain_15m, "1h": gain_1h,
+        "24h": gain_24h, "volume_15m": volume_ratio_15m,
+        "volume_1h": volume_ratio_1h, "acceleration": acceleration,
+        "buy_pressure": buy_pressure_15m, "upper_wick_ratio": upper_wick_ratio,
+        "breakout": breakout_pct, "rsi14": rsi14, "quote_volume": qv24,
+    }
+    if explosive_early_gate(explosive_probe):
+        setup = "EXPLOSIVE EARLY"
 
     # Final gate: لا يكفي score مرتفع؛ لازم السعر يؤكد الاستمرار بدون exhaustion.
     price_confirmation = (
@@ -740,9 +822,6 @@ def analyze(symbol, ticker):
         "efficiency": efficiency,
         "price_confirmation": price_confirmation,
         "continuation_quality": continuation_quality,
-        "hard_block": hard_block,
-        "block_reason": ", ".join(block_reasons) if block_reasons else "",
-        "trade_levels": build_trade_levels(price, atr14_pct),
     }
 
 
@@ -1007,13 +1086,9 @@ def format_final(x, confirmations, cross_label=None, cross_detail=None):
         emoji = CROSS_LABEL_EMOJI.get(cross_label, "")
         cross_section = f"\nCross-exchange check: {emoji} {cross_label}\n{cross_detail}\n"
 
-    levels = x.get("trade_levels") or build_trade_levels(x["price"], x.get("atr_pct"))
-    signal_time_cairo = cairo_timestamp()
     return f"""🔥 FINAL EARLY-PUMP CANDIDATE
 
 ⚠️ إشارة تحليلية مبنية على نموذج early-opportunity، وليست ضمانًا أو أمر شراء.
-
-🕒 وقت الإرسال — القاهرة: {signal_time_cairo}
 
 COIN: {x['symbol']}
 SETUP: {x['setup']}
@@ -1052,15 +1127,9 @@ Confirmation scans: {confirmations}
 حجم غير طبيعي + استمرار حجم + حركة سعر ما زالت محدودة نسبيًا
 + اتجاه/ضغط شراء + فلتر ضد الـexhaustion.
 
-🎯 مستويات إرشادية من ATR14 — ليست أوامر تداول:
-💰 دخول مرجعي: {levels['entry']:.12g}
-🛑 وقف خسارة: {levels['stop_loss']:.12g}  (-{levels['stop_pct']:.2f}%)
-🥅 TP1: {levels['tp1']:.12g}  (+{TP1_R:.1f}R)
-🥅 TP2: {levels['tp2']:.12g}  (+{TP2_R:.1f}R)
-🥅 TP3: {levels['tp3']:.12g}  (+{TP3_R:.1f}R)
-
-المستويات محسوبة من سعر الإشارة وATR14 لتناسب تذبذب العملة،
-وليست ضمانًا للوصول إليها. لا يوجد تداول آلي.
+🚫 لا يوجد Target ثابت +25%/+30% في هذه النسخة.
+الهدف الثابت كان يوحي بقدرة على توقع مسافة الحركة، بينما النموذج
+الحالي يقيس جودة البداية فقط. سيتم قياس MFE / MAE فعليًا بعد الإشارة.
 
 📊 سيتم الآن تتبع النتيجة:
 5m / 15m / 30m / 1h / 4h / 24h
@@ -1099,10 +1168,7 @@ def maybe_final_signal(x, now):
         if now - final_cooldown[symbol] < FINAL_COOLDOWN_HOURS * 3600:
             return False
 
-    # لا ندخل confirmation إلا إذا score + price gate + hard gates اجتمعوا.
-    if x.get("hard_block", False):
-        print(f"[HARD BLOCK] {symbol}: {x.get('block_reason', '')}")
-        return False
+    # لا ندخل confirmation إلا إذا score + price gate اجتمعوا.
     if x["score"] < FINAL_SCORE or not has_price_confirmation(x):
         c = candidates.get(symbol)
         if c and (now - c["last_ts"]) > CANDIDATE_EXPIRY_MINUTES * 60:
@@ -1140,6 +1206,7 @@ def maybe_final_signal(x, now):
     second_confirmed = (
         x["score"] >= FINAL_SCORE
         and has_price_confirmation(x)
+        and (strict_pump_gate(x) or explosive_early_gate(x))
         and x.get("continuation_quality", False)
         and x["5m"] > -0.5
         and x["15m"] >= first["15m"] - 1.0
@@ -1299,7 +1366,7 @@ def run_cycle(symbols):
             # نفسه بيتحرك فعلاً (مش بس الحجم)، عشان نتجنب حالات زي
             # DODOUSDT/MEMEUSDT اللي وصلت Score 80+ بسبب حجم ضخم
             # بينما السعر كان شبه ثابت أو نازل.
-            if x["score"] >= FINAL_SCORE and has_price_confirmation(x) and not x.get("hard_block", False):
+            if x["score"] >= FINAL_SCORE and has_price_confirmation(x):
                 maybe_final_signal(x, now)
 
     print(f"\nActive final tracks: {len(active_tracks)}")
