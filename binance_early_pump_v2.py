@@ -103,6 +103,13 @@ STABLE_BASES = {
     "USDE", "USD1", "RLUSD", "USDD", "EUR", "EURI", "USTC"
 }
 
+# عملات عملاقة (mega-cap): سيولتها وحجمها الضخم بيخلي حركة 0.3-2%
+# تظهر بنسب حجم/تسارع عالية نسبيًا من غير ما تكون فعليًا "انفجار
+# مبكر" - زي ما حصل مع BTC/ETH/BNB اللي وصلت FINAL بحركة 1h أقل من
+# 1%. بنستبعدهم استبعاد ثابت من كل مسارات FINAL، مش بس نشدد عليهم.
+# ممكن تضيف عملات تانية هنا (SOL, XRP, ADA...) لو شفت نفس المشكلة.
+MEGA_CAP_BASES = {"BTC", "ETH", "BNB"}
+
 def explosive_early_gate(x):
     """مسار التقاط بداية الانفجار بدون انتظار 15m +1.25%."""
     symbol = x.get("symbol", "")
@@ -339,7 +346,7 @@ SHARIAH_COMPLIANT_BASES = {
 # للمسح الكامل زي الأول. ملحوظة: تفعيلها هيقلل عدد الإشارات بشكل
 # واضح، لأن معظم القفزات الكبيرة (30%+) بتحصل في عملات صغيرة
 # مش موجودة في القايمة دي أصلًا.
-SHARIAH_FILTER_ENABLED = False  # التحليل الجديد: لا نستبعد العملات غير الموجودة في القائمة تلقائيًا
+SHARIAH_FILTER_ENABLED = True
 
 
 def get_symbols():
@@ -362,6 +369,9 @@ def get_symbols():
 
         base = symbol[:-4]  # إزالة "USDT" من آخر الاسم
         if base in STABLECOIN_BASES:
+            continue
+
+        if base in MEGA_CAP_BASES:
             continue
 
         if SHARIAH_FILTER_ENABLED and base not in SHARIAH_COMPLIANT_BASES:
@@ -778,10 +788,23 @@ def analyze(symbol, ticker):
         setup = "EXPLOSIVE EARLY"
 
     # Final gate: لا يكفي score مرتفع؛ لازم السعر يؤكد الاستمرار بدون exhaustion.
+    #
+    # المسار التالت (breakout + close_location) كان شرطه سهل قوي
+    # (close_location>=0.70 بس)، وده اللي سمح لعملات عملاقة هادية زي
+    # BTC/ETH/BNB تعدي بحركة 15m/1h أقل من 1% لمجرد إنها قاعدة قريب
+    # من قمتها المحلية بحجم معقول. شدّدناه: لازم إغلاق قريب جدًا من
+    # القمة (0.85+) + حجم 1h فعلاً مرتفع (2.5x+)، مش بس "هادي وقريب
+    # من القمة". المفروض يفضل يمسك اختراقات حقيقية حديثة، ويرفض
+    # العملات العملاقة اللي بتتحرك ببطء وبثبات.
     price_confirmation = (
         gain_15m >= 1.0
         or gain_1h >= 2.0
-        or (breakout_pct >= -1.0 and close_location >= 0.70)
+        or (
+            breakout_pct >= 0.0
+            and close_location >= 0.90
+            and volume_ratio_1h >= 4.0
+            and gain_15m >= 0.4
+        )
     )
     continuation_quality = (
         buy_pressure_15m >= 0.52
