@@ -83,6 +83,22 @@ EXPLOSIVE_MIN_BREAKOUT = -1.50
 EXPLOSIVE_MIN_GREEN_STREAK = 3            # جديد
 EXPLOSIVE_MIN_TREND_CONTINUITY = 4        # جديد
 
+# ---------- PERSISTENT EXPLOSION lane ----------
+# مسار منفصل للحالات التي يكون فيها الحجم مستمرًا لكن acceleration منخفض/سلبي.
+# هذا يعالج نمط ORCA / MET / TRB بدل إجبار كل انفجار على acceleration مرتفع.
+PERSISTENT_FINAL_SCORE = 68
+PERSISTENT_MIN_5M_MOVE = 1.0
+PERSISTENT_MIN_15M_MOVE = 1.75
+PERSISTENT_MIN_VOLUME_15M = 2.5
+PERSISTENT_MIN_VOLUME_1H = 2.5
+PERSISTENT_MIN_PERSISTENCE = 2.5
+PERSISTENT_MIN_BUY_PRESSURE = 0.54
+PERSISTENT_MAX_1H_GAIN = 18.0
+PERSISTENT_MAX_24H_GAIN = 15.0
+PERSISTENT_MAX_RSI = 80.0
+PERSISTENT_MAX_UPPER_WICK = 0.45
+PERSISTENT_MIN_BREAKOUT = -1.25
+
 STABLE_BASES = {
     "USDT", "USDC", "FDUSD", "TUSD", "USDP", "DAI",
     "USDE", "USD1", "RLUSD", "USDD", "EUR", "EURI", "USTC",
@@ -122,6 +138,8 @@ TRACK_MINUTES = [5, 15, 30, 60, 240, 1440]
 TRACK_FILE = "early_pump_signal_results.csv"
 EARLY_WATCH_LOG_FILE = "early_watch_log.csv"
 EARLY_WATCH_COOLDOWN_HOURS = 2
+LOG_RETENTION_DAYS = 3  # الاحتفاظ بآخر 3 أيام فقط في ملفات CSV
+LOG_CLEANUP_INTERVAL_HOURS = 6
 
 # ---------- Telegram ----------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -738,6 +756,11 @@ def analyze(symbol, ticker):
     }
     if explosive_early_gate(explosive_probe):
         setup = "EXPLOSIVE EARLY"
+    elif persistent_explosion_gate({
+        **explosive_probe,
+        "volume_persistence": volume_persistence,
+    }):
+        setup = "PERSISTENT EXPLOSION"
 
     price_confirmation = (
         (gain_15m >= 1.0 and gain_5m >= 0.3)
@@ -844,6 +867,51 @@ def explosive_early_gate(x):
                 and early_ok and trend_ok and liquidity_ok)
 
 
+def persistent_explosion_gate(x):
+    """
+    مسار انفجار مستمر: حجم قوي في 15m و1h + حركة سعر حقيقية،
+    حتى لو acceleration لم يعد مرتفعًا لأن الموجة بدأت قبل لحظة الفحص.
+    لا يعتمد على green_streak/trend_continuity الصارمين حتى لا نصل متأخرين.
+    """
+    sym = x.get("symbol", "")
+    base = sym[:-4] if sym.endswith("USDT") else sym
+    if base in STABLE_BASES:
+        return False
+    if x.get("is_wash"):
+        return False
+
+    if x.get("quote_volume", 0) < FINAL_MIN_24H_VOLUME:
+        return False
+    if x.get("5m", -999) < PERSISTENT_MIN_5M_MOVE:
+        return False
+    if x.get("15m", -999) < PERSISTENT_MIN_15M_MOVE:
+        return False
+    if x.get("volume_15m", 0) < PERSISTENT_MIN_VOLUME_15M:
+        return False
+    if x.get("volume_1h", 0) < PERSISTENT_MIN_VOLUME_1H:
+        return False
+    if x.get("volume_persistence", 0) < PERSISTENT_MIN_PERSISTENCE:
+        return False
+
+    rsi = x.get("rsi14")
+    if rsi is None or rsi >= PERSISTENT_MAX_RSI:
+        return False
+    if x.get("buy_pressure", 0) < PERSISTENT_MIN_BUY_PRESSURE:
+        return False
+    if x.get("upper_wick_ratio", 1.0) >= PERSISTENT_MAX_UPPER_WICK:
+        return False
+    if x.get("breakout", -999) < PERSISTENT_MIN_BREAKOUT:
+        return False
+
+    # يسمح بالموجة التي وصلت 10-18% على 1h، لكن ليس بموجة متأخرة جدًا.
+    if x.get("1h", 999) > PERSISTENT_MAX_1H_GAIN:
+        return False
+    if x.get("24h", 999) > PERSISTENT_MAX_24H_GAIN:
+        return False
+
+    return True
+
+
 def strict_pump_gate(x):
     sym = x.get("symbol", "")
     base = sym[:-4] if sym.endswith("USDT") else sym
@@ -896,7 +964,23 @@ def strict_pump_gate(x):
 def has_price_confirmation(x):
     if not x.get("price_confirmation") or not x.get("continuation_quality"):
         return False
-    return bool(strict_pump_gate(x) or explosive_early_gate(x))
+    return bool(
+        strict_pump_gate(x)
+        or explosive_early_gate(x)
+        or persistent_explosion_gate(x)
+    )
+
+
+def final_candidate_eligible(x):
+    """تحديد مسار FINAL بدون خفض الحد العام للمسار العادي."""
+    if not has_price_confirmation(x):
+        return False
+    if x.get("score", 0) >= FINAL_SCORE:
+        return True
+    return bool(
+        x.get("score", 0) >= PERSISTENT_FINAL_SCORE
+        and persistent_explosion_gate(x)
+    )
 
 
 # ============================================================
@@ -1094,6 +1178,43 @@ Confirmation scans: {confirmations}
 
 
 # ============================================================
+# Log retention
+# ============================================================
+
+def cleanup_old_csv_logs(force=False):
+    """
+    يحذف تلقائيًا أي سجل أقدم من 3 أيام من ملفات اللوج التي
+    يتم فتحها في Excel، مع الاحتفاظ بعنوان الأعمدة.
+    """
+    now = datetime.now(timezone.utc)
+    cutoff = now.timestamp() - (LOG_RETENTION_DAYS * 86400)
+
+    files = [
+        (EARLY_WATCH_LOG_FILE, "logged_time_utc"),
+        (TRACK_FILE, "final_time_utc"),
+    ]
+
+    for filename, time_col in files:
+        if not os.path.exists(filename):
+            continue
+        try:
+            df = pd.read_csv(filename)
+            if df.empty or time_col not in df.columns:
+                continue
+
+            dates = pd.to_datetime(df[time_col], utc=True, errors="coerce")
+            before = len(df)
+            df = df[dates.notna() & (dates.astype("int64") / 10**9 >= cutoff)]
+            removed = before - len(df)
+
+            if removed > 0:
+                df.to_csv(filename, index=False)
+                log.info(f"Log cleanup: حذف {removed} سجل قديم من {filename} (أقدم من {LOG_RETENTION_DAYS} أيام)")
+        except Exception as e:
+            log.warning(f"Log cleanup failed for {filename}: {e}")
+
+
+# ============================================================
 # Tracking
 # ============================================================
 
@@ -1256,7 +1377,7 @@ def maybe_final_signal(x, now):
         if now - final_cooldown[sym] < FINAL_COOLDOWN_HOURS * 3600:
             return False
 
-    if x["score"] < FINAL_SCORE or not has_price_confirmation(x):
+    if not final_candidate_eligible(x):
         c = candidates.get(sym)
         if c and (now - c["last_ts"]) > CANDIDATE_EXPIRY_MINUTES * 60:
             del candidates[sym]
@@ -1280,8 +1401,7 @@ def maybe_final_signal(x, now):
 
     first = c["first"]
     second_confirmed = (
-        x["score"] >= FINAL_SCORE
-        and has_price_confirmation(x)
+        final_candidate_eligible(x)
         and x.get("continuation_quality", False)
         and x["5m"] > -0.3
         and x["15m"] >= first["15m"] - 1.0
@@ -1404,7 +1524,7 @@ def run_cycle(symbols):
                 f"Liq={x['liquidity']}"
             )
             log_early_watch(x, now)
-            if x["score"] >= FINAL_SCORE and has_price_confirmation(x):
+            if final_candidate_eligible(x):
                 maybe_final_signal(x, now)
 
     cleanup_expired_candidates(now)
@@ -1421,6 +1541,7 @@ ONCE = "--once" in sys.argv
 
 init_results_file()
 load_state()
+cleanup_old_csv_logs(force=True)
 
 log.info("تحميل قائمة Binance...")
 try:
@@ -1442,10 +1563,15 @@ if ONCE:
     save_state()
     sys.exit(0)
 
+last_log_cleanup_ts = time.time()
+
 while True:
     try:
         sleep_time = run_cycle(symbols)
         save_state()
+        if time.time() - last_log_cleanup_ts >= LOG_CLEANUP_INTERVAL_HOURS * 3600:
+            cleanup_old_csv_logs()
+            last_log_cleanup_ts = time.time()
         log.info(f"Next scan in {sleep_time:.0f}s...")
         time.sleep(sleep_time)
     except KeyboardInterrupt:
