@@ -1,5 +1,5 @@
 # ============================================================
-# BINANCE EARLY-PUMP SCANNER V3.2 — VPS / COLAB / TELEGRAM
+# BINANCE EARLY-PUMP SCANNER V3.2+DIAGNOSTICS — VPS / COLAB / TELEGRAM
 # ============================================================
 # نسخة محسّنة بناءً على تحليل نتائج فعلية (2026-10-06):
 # - إصلاح فشل CRCLBUSDT (score=100 بدون انفجار)
@@ -159,11 +159,21 @@ CROSS_CACHE_TTL_SECONDS = 300
 TRACK_MINUTES = [5, 15, 30, 60, 240, 1440]
 TRACK_FILE = "early_pump_signal_results.csv"
 EARLY_WATCH_LOG_FILE = "early_watch_log.csv"
+SCAN_DIAGNOSTICS_FILE = "early_scan_diagnostics.csv"
+PREPUMP_MIN_SCORE = 55
+PREPUMP_MAX_BREAKOUT = -6.0
+PREPUMP_MIN_4H_GAIN = 0.5
+PREPUMP_MIN_VOLUME_1H = 1.5
+PREPUMP_MIN_VOLUME_15M = 1.2
+OKX_LEAD_MIN_1H_GAIN = 2.0
+OKX_LEAD_MAX_BINANCE_1H_GAIN = 1.0
+OKX_LEAD_COOLDOWN_HOURS = 4
+OKX_LEAD_MAX_CHECKS_PER_CYCLE = 10
 EARLY_WATCH_COOLDOWN_HOURS = 2
 
 # ---------- CSV log retention ----------
-LOG_RETENTION_DAYS = 3
-LOG_CLEANUP_INTERVAL_HOURS = 6
+LOG_RETENTION_DAYS = 4
+LOG_CLEANUP_INTERVAL_HOURS = 1
 
 # ---------- Shariah list auto-update ----------
 SHARIAH_CACHE_FILE = "shariah_compliant_bases.json"
@@ -187,6 +197,8 @@ final_cooldown = {}
 active_tracks = {}
 early_watch_logged = {}
 cross_cache = {}
+okx_lead_logged = {}
+shariah_excluded_this_startup = []
 
 
 # ============================================================
@@ -372,6 +384,8 @@ def update_shariah_list(force=False):
 
 
 def get_symbols():
+    global shariah_excluded_this_startup
+    shariah_excluded_this_startup = []
     data = get_json("/api/v3/exchangeInfo")
     out = []
     for s in data["symbols"]:
@@ -388,6 +402,7 @@ def get_symbols():
         if base in STABLECOIN_BASES or base in MEGA_CAP_BASES:
             continue
         if SHARIAH_FILTER_ENABLED and base not in SHARIAH_COMPLIANT_BASES:
+            shariah_excluded_this_startup.append(sym)
             continue
         out.append(sym)
     return out
@@ -604,10 +619,10 @@ def analyze(symbol, ticker):
         )
     except Exception as e:
         log.debug(f"analyze klines failed for {symbol}: {e}")
-        return None
+        return {"symbol": symbol, "_rejected": "KLINES_FETCH_ERROR"}
 
     if len(klines) < 80:
-        return None
+        return {"symbol": symbol, "_rejected": "INSUFFICIENT_KLINES"}
 
     k = klines[:-1]
 
@@ -620,22 +635,23 @@ def analyze(symbol, ticker):
 
     price = closes[-1]
     if price <= 0:
-        return None
+        return {"symbol": symbol, "_rejected": "INVALID_PRICE"}
 
     gain_5m = pct(closes[-1], closes[-2])
     gain_15m = pct(closes[-1], closes[-4])
     gain_1h = pct(closes[-1], closes[-13])
+    gain_4h = pct(closes[-1], closes[-49]) if len(closes) >= 49 else 0.0
     gain_24h = ticker["change"]
     qv24 = ticker["quote_volume"]
 
     if qv24 < MIN_24H_QUOTE_VOLUME:
-        return None
+        return {"symbol": symbol, "_rejected": "LOW_24H_QUOTE_VOLUME"}
     if gain_24h > MAX_24H_GAIN_PCT:
-        return None
+        return {"symbol": symbol, "_rejected": "24H_GAIN_ABOVE_MAX"}
     if gain_15m < MIN_15M_GAIN or gain_15m > MAX_15M_GAIN:
-        return None
+        return {"symbol": symbol, "_rejected": "15M_GAIN_OUT_OF_RANGE"}
     if gain_1h < MIN_1H_GAIN or gain_1h > MAX_1H_GAIN:
-        return None
+        return {"symbol": symbol, "_rejected": "1H_GAIN_OUT_OF_RANGE"}
 
     # Volume
     current_15m = sum(quote_volumes[-3:])
@@ -883,7 +899,7 @@ def analyze(symbol, ticker):
 
     # Explosive/Persistent/Reversal
     explosive_probe = {
-        "symbol": symbol, "5m": gain_5m, "15m": gain_15m, "1h": gain_1h,
+        "symbol": symbol, "score": score, "5m": gain_5m, "15m": gain_15m, "1h": gain_1h, "4h": gain_4h,
         "24h": gain_24h, "volume_15m": volume_ratio_15m,
         "volume_1h": volume_ratio_1h, "acceleration": acceleration,
         "buy_pressure": buy_pressure_15m, "upper_wick_ratio": upper_wick_ratio,
@@ -897,6 +913,8 @@ def analyze(symbol, ticker):
         setup = "PERSISTENT EXPLOSION"
     elif reversal_explosion_gate(explosive_probe):
         setup = "REVERSAL EXPLOSION"
+    elif prepump_compressed_gate(explosive_probe):
+        setup = "PRE-PUMP COMPRESSED"
 
     price_confirmation = (
         (gain_15m >= 1.0 and gain_5m >= 0.3)
@@ -918,7 +936,7 @@ def analyze(symbol, ticker):
         "symbol": symbol,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "price": price,
-        "5m": gain_5m, "15m": gain_15m, "1h": gain_1h, "24h": gain_24h,
+        "5m": gain_5m, "15m": gain_15m, "1h": gain_1h, "4h": gain_4h, "24h": gain_24h,
         "volume_1h": volume_ratio_1h,
         "volume_15m": volume_ratio_15m,
         "acceleration": acceleration,
@@ -1049,6 +1067,24 @@ def explosive_early_gate(x):
                 and early_ok and trend_ok and liquidity_ok)
 
 
+def prepump_compressed_gate(x):
+    """Watch-only hypothesis: compressed below recent high with early positive recovery."""
+    sym = x.get("symbol", "")
+    base = sym[:-4] if sym.endswith("USDT") else sym
+    return bool(
+        base not in STABLE_BASES
+        and not x.get("is_wash")
+        and x.get("score", 0) >= PREPUMP_MIN_SCORE
+        and x.get("breakout", 0) <= PREPUMP_MAX_BREAKOUT
+        and x.get("4h", -999) >= PREPUMP_MIN_4H_GAIN
+        and x.get("volume_1h", 0) >= PREPUMP_MIN_VOLUME_1H
+        and x.get("volume_15m", 0) >= PREPUMP_MIN_VOLUME_15M
+        and x.get("buy_pressure", 0) >= 0.52
+        and (x.get("rsi14") is not None and x.get("rsi14") < 76)
+        and x.get("quote_volume", 0) >= MIN_24H_QUOTE_VOLUME
+    )
+
+
 def strict_pump_gate(x):
     sym = x.get("symbol", "")
     base = sym[:-4] if sym.endswith("USDT") else sym
@@ -1150,9 +1186,14 @@ def get_bybit_klines_15m(symbol, limit=6):
         r.raise_for_status()
         data = r.json()
         if data.get("retCode") != 0:
+            log.debug(f"Bybit returned retCode={data.get('retCode')} for {symbol}: {data.get('retMsg')}")
             return None
-        return data.get("result", {}).get("list", []) or None
-    except Exception:
+        rows = data.get("result", {}).get("list", []) or None
+        if not rows:
+            log.debug(f"Bybit returned no spot candles for {symbol}")
+        return rows
+    except Exception as e:
+        log.debug(f"Bybit request failed for {symbol}: {type(e).__name__}: {e}")
         return None
 
 
@@ -1233,6 +1274,36 @@ def cross_exchange_confirmation(symbol):
     detail = " | ".join(notes) if notes else "لا توجد بيانات"
     cross_cache[symbol] = (now, label, detail)
     return label, detail
+
+
+def check_okx_lead_watch(x, now, now_iso):
+    """Send a WATCH-ONLY alert when OKX leads while Binance's 1h move is still small."""
+    sym = x.get("symbol", "")
+    if not sym or x.get("is_wash") or x.get("quote_volume", 0) < MIN_24H_QUOTE_VOLUME:
+        return None
+    last_sent = float(okx_lead_logged.get(sym, 0) or 0)
+    if now - last_sent < OKX_LEAD_COOLDOWN_HOURS * 3600:
+        return None
+    rows = get_okx_klines_15m(okx_inst_id(sym), limit=6)
+    okx_1h = klines_1h_change_pct(rows, close_index=4)
+    if okx_1h is None:
+        return {"symbol": sym, "stage": "OKX_LEAD_CHECK", "reason": "OKX_DATA_UNAVAILABLE"}
+    binance_1h = x.get("1h", 999)
+    if okx_1h >= OKX_LEAD_MIN_1H_GAIN and binance_1h <= OKX_LEAD_MAX_BINANCE_1H_GAIN:
+        okx_lead_logged[sym] = now
+        msg = (
+            "👀 OKX-LEAD WATCH (تنبيه مراقبة فقط، ليس دخولًا)\n"
+            f"COIN: {sym}\nOKX 1h: {okx_1h:+.2f}%\n"
+            f"Binance 1h: {binance_1h:+.2f}%\n"
+            f"Binance 15m: {x.get('15m', 0):+.2f}% | Score: {x.get('score', 0)}\n"
+            "الفرضية تحتاج تحقق تاريخي؛ لا تعتبر إشارة شراء مؤكدة."
+        )
+        telegram_send(msg)
+        log.info(msg)
+        return {"symbol": sym, "stage": "OKX_LEAD_WATCH", "reason": "OKX_UP_BINANCE_LAGGING",
+                "okx_1h": okx_1h, "binance_1h": binance_1h, "logged_time_utc": now_iso}
+    return {"symbol": sym, "stage": "OKX_LEAD_CHECK", "reason": "LEAD_CONDITIONS_NOT_MET",
+            "okx_1h": okx_1h, "binance_1h": binance_1h, "logged_time_utc": now_iso}
 
 
 CROSS_LABEL_EMOJI = {
@@ -1330,40 +1401,97 @@ Confirmation scans: {confirmations}
 # ============================================================
 
 def cleanup_old_csv_logs(force=False):
-    cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=LOG_RETENTION_DAYS)
+    """Remove rows older than four days; preserve rows with invalid timestamps."""
+    from datetime import timedelta
+    cutoff = datetime.now(timezone.utc) - timedelta(days=LOG_RETENTION_DAYS)
     files = [
         (EARLY_WATCH_LOG_FILE, ("logged_time_utc", "timestamp_utc", "timestamp", "time_utc", "time")),
         (TRACK_FILE, ("final_time_utc", "logged_time_utc", "timestamp_utc", "timestamp", "time_utc", "time")),
+        (SCAN_DIAGNOSTICS_FILE, ("logged_time_utc", "timestamp_utc", "timestamp", "time_utc", "time")),
     ]
     for filename, possible_columns in files:
         if not os.path.isfile(filename):
             continue
         tmp_name = filename + ".cleanup.tmp"
         try:
-            df = pd.read_csv(filename)
-            if df.empty:
-                continue
-            time_col = next((col for col in possible_columns if col in df.columns), None)
-            if time_col is None:
-                log.warning(f"CSV cleanup skipped {filename}: no recognized timestamp column; columns={list(df.columns)}")
-                continue
-            dates = pd.to_datetime(df[time_col], utc=True, errors="coerce")
-            old = dates.notna() & (dates < cutoff)
-            removed = int(old.sum())
-            if removed == 0:
-                log.info(f"CSV cleanup checked {filename}: no rows older than {LOG_RETENTION_DAYS} days ({len(df)} rows)")
-                continue
-            kept = df.loc[~old]
-            kept.to_csv(tmp_name, index=False)
-            os.replace(tmp_name, filename)
-            log.info(f"CSV cleanup: removed {removed} rows older than {LOG_RETENTION_DAYS} days from {filename}; kept {len(kept)}")
+            with open(filename, "r", newline="", encoding="utf-8-sig") as src:
+                reader = csv.reader(src)
+                header = next(reader, None)
+                if not header:
+                    continue
+                time_col = next((c for c in possible_columns if c in header), None)
+                if time_col is None:
+                    log.warning(f"CSV cleanup skipped {filename}: no timestamp column; columns={header}")
+                    continue
+                time_idx = header.index(time_col)
+                removed = kept = invalid_dates = 0
+                with open(tmp_name, "w", newline="", encoding="utf-8") as dst:
+                    writer = csv.writer(dst)
+                    writer.writerow(header)
+                    for row in reader:
+                        if not row:
+                            continue
+                        raw_ts = row[time_idx].strip() if len(row) > time_idx else ""
+                        try:
+                            ts = pd.to_datetime(raw_ts, utc=True, errors="raise").to_pydatetime()
+                            if ts < cutoff:
+                                removed += 1
+                                continue
+                        except Exception:
+                            invalid_dates += 1
+                        writer.writerow(row)
+                        kept += 1
+            if removed:
+                os.replace(tmp_name, filename)
+                log.info(f"CSV cleanup: removed {removed} rows older than {LOG_RETENTION_DAYS} days from {filename}; kept {kept}")
+            else:
+                os.remove(tmp_name)
+                log.info(f"CSV cleanup checked {filename}: no old rows removed (retention={LOG_RETENTION_DAYS} days)")
+            if invalid_dates:
+                log.warning(f"CSV cleanup preserved {invalid_dates} rows with invalid timestamps in {filename}")
         except Exception as e:
             try:
-                if os.path.exists(tmp_name):
-                    os.remove(tmp_name)
+                if os.path.exists(tmp_name): os.remove(tmp_name)
             except OSError:
                 pass
             log.exception(f"CSV cleanup failed for {filename}: {e}")
+
+
+def append_scan_diagnostics(rows):
+    if not rows:
+        return
+    columns = [
+        "logged_time_utc", "symbol", "stage", "reason", "score", "setup",
+        "gain_5m", "gain_15m", "gain_1h", "gain_4h", "gain_24h",
+        "volume_15m", "volume_1h", "acceleration", "buy_pressure",
+        "breakout", "trend_continuity", "green_streak", "is_wash", "quote_volume",
+        "candidate_count", "final_eligible", "okx_1h", "binance_1h",
+    ]
+    exists = os.path.exists(SCAN_DIAGNOSTICS_FILE) and os.path.getsize(SCAN_DIAGNOSTICS_FILE) > 0
+    with open(SCAN_DIAGNOSTICS_FILE, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
+        if not exists:
+            writer.writeheader()
+        writer.writerows({key: row.get(key, "") for key in columns} for row in rows)
+
+
+def diagnostic_row(now_iso, symbol, stage, reason, result=None, **extra):
+    row = {"logged_time_utc": now_iso, "symbol": symbol, "stage": stage, "reason": reason}
+    if result:
+        row.update({
+            "score": result.get("score", ""), "setup": result.get("setup", ""),
+            "gain_5m": result.get("5m", ""), "gain_15m": result.get("15m", ""),
+            "gain_1h": result.get("1h", ""), "gain_4h": result.get("4h", ""),
+            "gain_24h": result.get("24h", ""), "volume_15m": result.get("volume_15m", ""),
+            "volume_1h": result.get("volume_1h", ""), "acceleration": result.get("acceleration", ""),
+            "buy_pressure": result.get("buy_pressure", ""), "breakout": result.get("breakout", ""),
+            "trend_continuity": result.get("trend_continuity", ""),
+            "green_streak": result.get("green_streak", ""),
+            "is_wash": int(bool(result.get("is_wash", False))),
+            "quote_volume": result.get("quote_volume", ""),
+        })
+    row.update(extra)
+    return row
 
 
 # ============================================================
@@ -1386,43 +1514,45 @@ def init_results_file():
 
 
 def save_track(track):
+    """Upsert one row per signal identity instead of appending every scan cycle."""
     row = {
-        "final_time_utc": track["final_time_utc"],
-        "symbol": track["symbol"],
-        "setup": track["setup"],
-        "score": track["score"],
-        "entry_price": track["entry_price"],
-        "sl": track.get("sl"),
-        "sl_pct": track.get("sl_pct"),
-        "tp1": track.get("tp1"),
-        "tp1_pct": track.get("tp1_pct"),
-        "tp2": track.get("tp2"),
-        "tp2_pct": track.get("tp2_pct"),
-        "atr_used": track.get("atr_used"),
-        "quote_volume": track["quote_volume"],
-        "liquidity": track["liquidity"],
-        "gain_5m_at_alert": track["gain_5m_at_alert"],
-        "gain_15m_at_alert": track["gain_15m_at_alert"],
-        "gain_1h_at_alert": track["gain_1h_at_alert"],
-        "gain_24h_at_alert": track["gain_24h_at_alert"],
-        "peak_price": track["peak_price"],
-        "lowest_price": track["lowest_price"],
-        "mfe_pct": track["mfe_pct"],
-        "mae_pct": track["mae_pct"],
-        "result_5m": track["results"].get(5),
-        "result_15m": track["results"].get(15),
-        "result_30m": track["results"].get(30),
-        "result_1h": track["results"].get(60),
-        "result_4h": track["results"].get(240),
-        "result_24h": track["results"].get(1440),
+        "final_time_utc": track["final_time_utc"], "symbol": track["symbol"],
+        "setup": track["setup"], "score": track["score"],
+        "entry_price": track["entry_price"], "sl": track.get("sl"), "sl_pct": track.get("sl_pct"),
+        "tp1": track.get("tp1"), "tp1_pct": track.get("tp1_pct"), "tp2": track.get("tp2"),
+        "tp2_pct": track.get("tp2_pct"), "atr_used": track.get("atr_used"),
+        "quote_volume": track["quote_volume"], "liquidity": track["liquidity"],
+        "gain_5m_at_alert": track["gain_5m_at_alert"], "gain_15m_at_alert": track["gain_15m_at_alert"],
+        "gain_1h_at_alert": track["gain_1h_at_alert"], "gain_24h_at_alert": track["gain_24h_at_alert"],
+        "peak_price": track["peak_price"], "lowest_price": track["lowest_price"],
+        "mfe_pct": track["mfe_pct"], "mae_pct": track["mae_pct"],
+        "result_5m": track["results"].get(5), "result_15m": track["results"].get(15),
+        "result_30m": track["results"].get(30), "result_1h": track["results"].get(60),
+        "result_4h": track["results"].get(240), "result_24h": track["results"].get(1440),
         "status": track["status"],
     }
-    pd.DataFrame([row]).to_csv(
-        TRACK_FILE,
-        mode="a",
-        header=not os.path.exists(TRACK_FILE),
-        index=False,
-    )
+    if os.path.exists(TRACK_FILE) and os.path.getsize(TRACK_FILE) > 0:
+        try:
+            df = pd.read_csv(TRACK_FILE)
+            for col in row:
+                if col not in df.columns:
+                    df[col] = pd.NA
+            # Remove duplicate records left by the previous repeated-append bug.
+            if {"final_time_utc", "symbol"}.issubset(df.columns):
+                df = df.drop_duplicates(subset=["final_time_utc", "symbol"], keep="last")
+                mask = (df["final_time_utc"].astype(str) == str(row["final_time_utc"])) & (df["symbol"].astype(str) == str(row["symbol"]))
+                if mask.any():
+                    idx = df.index[mask][-1]
+                    for col, value in row.items(): df.at[idx, col] = value
+                else:
+                    df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+            else:
+                df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+            df.to_csv(TRACK_FILE, index=False)
+            return
+        except Exception as e:
+            log.warning(f"Track upsert fallback to append for {track.get('symbol')}: {e}")
+    pd.DataFrame([row]).to_csv(TRACK_FILE, mode="a", header=not os.path.exists(TRACK_FILE), index=False)
 
 
 def update_tracking(tickers):
@@ -1615,6 +1745,8 @@ def save_state():
         "final_cooldown": final_cooldown,
         "active_tracks": active_tracks,
         "early_watch_logged": early_watch_logged,
+        "okx_lead_logged": okx_lead_logged,
+        "shariah_excluded_logged": shariah_excluded_logged,
     }
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
@@ -1638,6 +1770,8 @@ def load_state():
             candidates[sym] = cand
     final_cooldown.update(state.get("final_cooldown", {}))
     early_watch_logged.update(state.get("early_watch_logged", {}))
+    okx_lead_logged.update({k: float(v) for k, v in state.get("okx_lead_logged", {}).items()})
+    shariah_excluded_logged.update({k: float(v) for k, v in state.get("shariah_excluded_logged", {}).items()})
 
     for sym, tr in state.get("active_tracks", {}).items():
         tr["results"] = {int(k): v for k, v in tr.get("results", {}).items()}
@@ -1652,52 +1786,93 @@ def run_cycle(symbols):
     cycle_start = time.time()
     tickers = get_tickers()
     update_tracking(tickers)
+    now = time.time()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    diagnostics = []
 
-    universe = [
-        s for s in symbols
-        if s in tickers
-        and tickers[s]["quote_volume"] >= MIN_24H_QUOTE_VOLUME
-        and tickers[s]["change"] <= MAX_24H_GAIN_PCT
-    ]
+    # Log symbols excluded by the Shariah universe filter so absence is explainable.
+    for excluded_symbol in shariah_excluded_this_startup:
+        last_logged = float(shariah_excluded_logged.get(excluded_symbol, 0) or 0)
+        if now - last_logged >= 24 * 3600:
+            diagnostics.append(diagnostic_row(now_iso, excluded_symbol, "SHARIAH_FILTER", "NOT_IN_CURRENT_COMPLIANT_LIST"))
+            shariah_excluded_logged[excluded_symbol] = now
+    shariah_excluded_this_startup.clear()
+
+    universe = []
+    for symbol in symbols:
+        ticker = tickers.get(symbol)
+        if ticker is None:
+            diagnostics.append(diagnostic_row(now_iso, symbol, "TICKER_DATA", "SYMBOL_MISSING_FROM_TICKERS"))
+        elif ticker["quote_volume"] < MIN_24H_QUOTE_VOLUME:
+            diagnostics.append(diagnostic_row(now_iso, symbol, "UNIVERSE_FILTER", "LOW_24H_QUOTE_VOLUME", quote_volume=ticker["quote_volume"], gain_24h=ticker["change"]))
+        elif ticker["change"] > MAX_24H_GAIN_PCT:
+            diagnostics.append(diagnostic_row(now_iso, symbol, "UNIVERSE_FILTER", "24H_GAIN_ABOVE_MAX", quote_volume=ticker["quote_volume"], gain_24h=ticker["change"]))
+        else:
+            universe.append(symbol)
 
     results = []
     with ThreadPoolExecutor(max_workers=10) as ex:
-        futures = {ex.submit(analyze, s, tickers[s]): s for s in universe}
+        futures = {ex.submit(analyze, symbol, tickers[symbol]): symbol for symbol in universe}
         for fut in as_completed(futures):
+            symbol = futures[fut]
             try:
-                r = fut.result()
-                if r and r["score"] >= WATCH_SCORE:
-                    results.append(r)
+                result = fut.result()
+                if not result:
+                    diagnostics.append(diagnostic_row(now_iso, symbol, "ANALYZE", "NO_RESULT"))
+                elif result.get("_rejected"):
+                    diagnostics.append(diagnostic_row(now_iso, symbol, "ANALYZE_FILTER", result["_rejected"]))
+                elif result["score"] < WATCH_SCORE and result.get("setup") != "PRE-PUMP COMPRESSED":
+                    diagnostics.append(diagnostic_row(now_iso, symbol, "SCORE_FILTER", f"SCORE_BELOW_WATCH_{WATCH_SCORE}", result))
+                else:
+                    results.append(result)
+                    diagnostics.append(diagnostic_row(now_iso, symbol, "WATCH_CANDIDATE", "SCORE_PASSED_WATCH" if result["score"] >= WATCH_SCORE else "PREPUMP_COMPRESSED_WATCH_ONLY", result))
             except Exception as e:
-                log.debug(f"analyze error: {e}")
+                log.debug(f"analyze error for {symbol}: {type(e).__name__}: {e}")
+                diagnostics.append(diagnostic_row(now_iso, symbol, "ANALYZE_ERROR", type(e).__name__))
 
     results.sort(key=lambda x: (x["score"], x["volume_1h"]), reverse=True)
-
-    now = time.time()
     log.info("=" * 70)
     log.info(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-
     if not results:
-        log.info(f"No watch candidates >= {WATCH_SCORE}")
+        log.info(f"No watch candidates >= {WATCH_SCORE} and no compressed watch candidates")
     else:
         log.info(f"Watch candidates: {len(results)}")
         for x in results[:10]:
             log.info(
-                f"{x['symbol']:12} Score={x['score']:3} "
-                f"15m={x['15m']:+6.2f}% Vol1h={x['volume_1h']:5.2f}x "
-                f"Vol15m={x['volume_15m']:5.2f}x Accel={x['acceleration']:4.2f}x "
-                f"TrendC={x.get('trend_continuity',0)}/8 "
-                f"Green={x.get('green_streak',0)} "
-                f"Wash={'YES' if x.get('is_wash') else 'no'} "
-                f"Liq={x['liquidity']}"
+                f"{x['symbol']:12} Score={x['score']:3} Setup={x['setup']} "
+                f"15m={x['15m']:+6.2f}% 1h={x['1h']:+6.2f}% 4h={x.get('4h', 0):+6.2f}% "
+                f"Vol1h={x['volume_1h']:5.2f}x Vol15m={x['volume_15m']:5.2f}x "
+                f"Accel={x['acceleration']:4.2f}x TrendC={x.get('trend_continuity',0)}/8 "
+                f"Green={x.get('green_streak',0)} Wash={'YES' if x.get('is_wash') else 'no'} Liq={x['liquidity']}"
             )
             log_early_watch(x, now)
-            if x["score"] >= MIN_CANDIDATE_SCORE:
-                maybe_final_signal(x, now)
+            if x["score"] >= MIN_CANDIDATE_SCORE and x["setup"] != "PRE-PUMP COMPRESSED":
+                eligible = final_candidate_eligible(x)
+                previous_count = candidates.get(x["symbol"], {}).get("count", 0)
+                sent = maybe_final_signal(x, now)
+                if sent:
+                    reason = "FINAL_SENT"
+                elif previous_count + 1 < CONFIRMATIONS_REQUIRED:
+                    reason = "WAITING_FOR_CONFIRMATIONS"
+                elif not eligible:
+                    reason = "FINAL_GATE_FAILED"
+                else:
+                    reason = "CONFIRMATION_QUALITY_OR_COOLDOWN"
+                diagnostics.append(diagnostic_row(now_iso, x["symbol"], "FINAL_DECISION", reason, x,
+                                                  candidate_count=candidates.get(x["symbol"], {}).get("count", 0),
+                                                  final_eligible=eligible))
 
+    # OKX lead experiment is a separate WATCH-only alert and never makes FINAL eligible.
+    for x in results[:OKX_LEAD_MAX_CHECKS_PER_CYCLE]:
+        row = check_okx_lead_watch(x, now, now_iso)
+        if row:
+            diagnostics.append(diagnostic_row(now_iso, row.get("symbol", x["symbol"]), row.get("stage", "OKX_LEAD_CHECK"), row.get("reason", "UNKNOWN"), x,
+                                              okx_1h=row.get("okx_1h", ""), binance_1h=row.get("binance_1h", "")))
+
+    append_scan_diagnostics(diagnostics)
     cleanup_expired_candidates(now)
+    cleanup_old_csv_logs(force=True)
     log.info(f"Active tracks: {len(active_tracks)} | Pending: {len(candidates)}")
-
     return max(10, SCAN_EVERY_SECONDS - (time.time() - cycle_start))
 
 
