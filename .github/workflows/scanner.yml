@@ -1,42 +1,47 @@
 name: Binance Early-Pump Scanner V2
+
 on:
-  schedule:
-    - cron: "*/5 * * * *"
+  # الجدولة الداخلية بتاعة GitHub (schedule/cron) اتشالت من هنا عمدًا:
+  # كانت بتتأخر 15-60+ دقيقة وقت الزحام، وده كان بيخلي السكانر يفوّت
+  # قفزات سريعة. دلوقتي خدمة خارجية (cron-job.org) هي اللي بتستدعي
+  # الـ workflow كل دقيقتين بدقة عن طريق GitHub API، فمحتاجين بس
+  # workflow_dispatch يفضل مفعّل عشان يستقبل الاستدعاء ده (وكمان
+  # يسمح بالتشغيل اليدوي من تبويب Actions لو احتجته).
   workflow_dispatch: {}
+
 permissions:
-  contents: write
-concurrency:
-  group: binance-scanner
-  cancel-in-progress: false
+  contents: write   # عشان الـ job يحفظ ملفات الحالة والنتائج في الريبو
+
+
 jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
           cache: 'pip'
+
       - name: Install dependencies
         run: pip install -r requirements.txt
+
       - name: Run one scan cycle
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python binance_early_pump_v2.py --once
-      - name: Save state, diagnostics, logs and Shariah cache
+
+      - name: Save state and results back to the repo
         if: always()
         run: |
           git config user.name "scanner-bot"
           git config user.email "scanner-bot@users.noreply.github.com"
-          git add scanner_state.json early_pump_signal_results.csv early_watch_log.csv early_scan_diagnostics.csv shariah_compliant_bases.json 2>/dev/null || true
-          if ! git diff --cached --quiet; then
-            git commit -m "Update scanner state and diagnostic logs [skip ci]"
-            git pull --rebase origin "${GITHUB_REF_NAME}"
-            git push origin "HEAD:${GITHUB_REF_NAME}"
-          else
-            echo "No state/log changes to commit."
-          fi
+          git add scanner_state.json early_pump_signal_results.csv early_watch_log.csv 2>/dev/null || true
+          git diff --cached --quiet || git commit -m "Update scanner state [skip ci]"
+          git push || true
