@@ -209,6 +209,9 @@ STABLECOIN_BASES = {
     "USDC", "FDUSD", "TUSD", "USDP", "DAI", "BUSD", "BFUSD",
     "USDE", "PYUSD", "EUR", "GBP", "AEUR", "USD1", "WBETH",
 }
+# User-maintained review allowlist, NOT a formal Shariah certification.
+# Crypto compliance can depend on the asset, project activity, and the user's scholar/screening standard.
+# Keep only assets you have personally verified with a trusted Shariah screening source.
 SHARIAH_COMPLIANT_BASES = {
     "BTC", "BNB", "ADA", "ETH", "XRP", "XLM", "USDT", "ALGO",
     "AVAX", "DOGE", "LTC", "DOT", "MATIC", "XTZ", "USDC", "SOL",
@@ -232,7 +235,7 @@ def get_symbols():
         if any(x in sym for x in ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")):
             continue
         base = sym[:-4]
-        if base in STABLECOIN_BASES or base in MEGA_CAP_BASES:
+        if base in STABLECOIN_BASES:
             continue
         if SHARIAH_FILTER_ENABLED and base not in SHARIAH_COMPLIANT_BASES:
             continue
@@ -1181,6 +1184,77 @@ Confirmation scans: {confirmations}
 # Log retention
 # ============================================================
 
+def repair_csv_schema(filename, expected_columns):
+    """
+    Keep the current schema consistent and safely discard malformed rows.
+    A timestamped backup is created before any rewrite.
+    """
+    if not os.path.exists(filename) or os.path.getsize(filename) == 0:
+        with open(filename, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(expected_columns)
+        return
+
+    try:
+        with open(filename, "r", newline="", encoding="utf-8-sig", errors="replace") as f:
+            rows = list(csv.reader(f))
+        if not rows:
+            with open(filename, "w", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(expected_columns)
+            return
+
+        old_columns = rows[0]
+        if old_columns == expected_columns and all(len(r) == len(expected_columns) for r in rows[1:]):
+            return
+
+        # Back up the original before migration/repair.
+        backup = filename + ".bak"
+        if not os.path.exists(backup):
+            import shutil
+            shutil.copy2(filename, backup)
+
+        old_index = {name: i for i, name in enumerate(old_columns)}
+        repaired = []
+        skipped = 0
+        for row in rows[1:]:
+            if len(row) != len(old_columns):
+                skipped += 1
+                continue
+            repaired.append([
+                row[old_index[name]] if name in old_index else ""
+                for name in expected_columns
+            ])
+
+        with open(filename, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(expected_columns)
+            writer.writerows(repaired)
+        log.warning(
+            f"CSV schema repaired for {filename}: kept {len(repaired)} rows, "
+            f"skipped {skipped} malformed rows; backup={backup}"
+        )
+    except Exception as e:
+        log.error(f"CSV schema repair failed for {filename}: {e}")
+        raise
+
+
+WATCH_COLUMNS = [
+    "logged_time_utc", "symbol", "setup", "score", "price",
+    "gain_15m", "gain_1h", "gain_24h", "volume_1h", "volume_15m",
+    "acceleration", "breakout", "liquidity", "quote_volume",
+    "trend_continuity", "green_streak", "is_wash",
+]
+TRACK_COLUMNS = [
+    "final_time_utc", "symbol", "setup", "score",
+    "entry_price", "sl", "sl_pct", "tp1", "tp1_pct", "tp2", "tp2_pct",
+    "atr_used", "quote_volume", "liquidity",
+    "gain_5m_at_alert", "gain_15m_at_alert",
+    "gain_1h_at_alert", "gain_24h_at_alert",
+    "peak_price", "lowest_price", "mfe_pct", "mae_pct",
+    "result_5m", "result_15m", "result_30m",
+    "result_1h", "result_4h", "result_24h", "status",
+]
+
+
 def cleanup_old_csv_logs(force=False):
     """
     يحذف تلقائيًا أي سجل أقدم من 3 أيام من ملفات اللوج التي
@@ -1190,15 +1264,16 @@ def cleanup_old_csv_logs(force=False):
     cutoff = now.timestamp() - (LOG_RETENTION_DAYS * 86400)
 
     files = [
-        (EARLY_WATCH_LOG_FILE, "logged_time_utc"),
-        (TRACK_FILE, "final_time_utc"),
+        (EARLY_WATCH_LOG_FILE, "logged_time_utc", WATCH_COLUMNS),
+        (TRACK_FILE, "final_time_utc", TRACK_COLUMNS),
     ]
 
-    for filename, time_col in files:
+    for filename, time_col, columns in files:
         if not os.path.exists(filename):
             continue
         try:
-            df = pd.read_csv(filename)
+            repair_csv_schema(filename, columns)
+            df = pd.read_csv(filename, dtype=str, keep_default_na=False)
             if df.empty or time_col not in df.columns:
                 continue
 
@@ -1219,18 +1294,7 @@ def cleanup_old_csv_logs(force=False):
 # ============================================================
 
 def init_results_file():
-    columns = [
-        "final_time_utc", "symbol", "setup", "score",
-        "entry_price", "sl", "sl_pct", "tp1", "tp1_pct", "tp2", "tp2_pct",
-        "atr_used", "quote_volume", "liquidity",
-        "gain_5m_at_alert", "gain_15m_at_alert",
-        "gain_1h_at_alert", "gain_24h_at_alert",
-        "peak_price", "lowest_price", "mfe_pct", "mae_pct",
-        "result_5m", "result_15m", "result_30m",
-        "result_1h", "result_4h", "result_24h", "status",
-    ]
-    if not os.path.exists(TRACK_FILE):
-        pd.DataFrame(columns=columns).to_csv(TRACK_FILE, index=False)
+    repair_csv_schema(TRACK_FILE, TRACK_COLUMNS)
 
 
 def save_track(track):
@@ -1314,17 +1378,9 @@ def log_early_watch(x, now):
     if last is not None and now - last < EARLY_WATCH_COOLDOWN_HOURS * 3600:
         return
     early_watch_logged[sym] = now
-    exists = os.path.exists(EARLY_WATCH_LOG_FILE)
+    repair_csv_schema(EARLY_WATCH_LOG_FILE, WATCH_COLUMNS)
     with open(EARLY_WATCH_LOG_FILE, "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        if not exists:
-            w.writerow([
-                "logged_time_utc", "symbol", "setup", "score", "price",
-                "gain_15m", "gain_1h", "gain_24h",
-                "volume_1h", "volume_15m", "acceleration",
-                "breakout", "liquidity", "quote_volume",
-                "trend_continuity", "green_streak", "is_wash",
-            ])
         w.writerow([
             datetime.now(timezone.utc).isoformat(), sym, x["setup"], x["score"], x["price"],
             x["15m"], x["1h"], x["24h"],
@@ -1550,7 +1606,9 @@ except Exception as e:
     log.error(f"Cannot load symbols: {e}")
     sys.exit(1)
 
-log.info(f"تم تحميل {len(symbols)} زوج USDT.")
+log.info(f"تم تحميل {len(symbols)} زوج USDT بعد فلتر قائمة العملات المسموح بها.")
+log.info(f"Shariah allowlist filter: {'ENABLED' if SHARIAH_FILTER_ENABLED else 'DISABLED'}; "
+         f"allowlist assets={len(SHARIAH_COMPLIANT_BASES)} (user-maintained, not certification).")
 log.info("Scanner V3 started" + (" (single run)." if ONCE else "."))
 
 if ONCE:
